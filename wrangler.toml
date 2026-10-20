@@ -1,0 +1,12 @@
+# Cloudflare Pages serves static assets only.
+#
+# Build command:  npm run build      (runs `nuxt generate`)
+# Build output:   .output/public
+#
+# This project is fully static: it renders the map client-side and reads radar
+# data straight from the BMKG proxy (darma-proxy.lleans.dev), which sends
+# `access-control-allow-origin: *`. No Functions or server code are required.
+
+name = "vue-simple-bmkg-radar"
+compatibility_date = "2025-07-15"
+pages_build_output_dir = ".output/public"

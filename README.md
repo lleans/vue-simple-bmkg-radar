@@ -1,6 +1,13 @@
-# Nuxt Minimal Starter
+# Simple BMKG Radar Viewer (Nuxt 4 + Vue 3)
 
-Look at the [Nuxt documentation](https://nuxt.com/docs/getting-started/introduction) to learn more.
+Interactive web client for BMKG SI-DARMA weather radar data across Indonesia, built with Nuxt 4, Vue 3, Google Maps (`vue3-google-map`), Tailwind CSS, and shadcn-vue (`reka-ui`).
+
+## Radar API Backend
+
+This app connects to the Rust Cloudflare Worker proxy (`darma-proxy-rust-cloudflare`):
+- **Production API Base**: `https://darma-proxy-rust-cloudflare.ahmadunnail0.workers.dev`
+- **Interactive Documentation**: `https://darma-proxy-rust-cloudflare.ahmadunnail0.workers.dev/docs`
+- **API & Products Reference**: See [docs/DARMA_RADAR_API.md](docs/DARMA_RADAR_API.md) for full endpoint specifications, catalog of all 14 nowcast products, and integration patterns.
 
 ## Setup
 
