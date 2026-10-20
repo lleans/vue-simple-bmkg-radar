@@ -11,6 +11,10 @@ export default defineNuxtConfig({
   // is unset in both modes, so that check is always true and would enable
   // devtools in production too.
   devtools: { enabled: import.meta.dev },
+  // Pin the Nitro preset. Cloudflare sets CF_PAGES in its build, which makes
+  // Nitro auto-select `cloudflare-pages-static` and write to `dist/` instead
+  // of `.output/public/`. The output directory must not depend on the host.
+  nitro: { preset: 'static' },
   css: ['~/assets/css/main.css'],
   vite: {
     plugins: [
