@@ -10,3 +10,8 @@
 name = "vue-simple-bmkg-radar"
 compatibility_date = "2025-07-15"
 pages_build_output_dir = ".output/public"
+
+# Build-time Node version for Pages. Nuxt 4 needs a current Node, and Pages'
+# default can be older. Hardcoded here rather than set in the dashboard.
+[vars]
+NODE_VERSION = "22"
