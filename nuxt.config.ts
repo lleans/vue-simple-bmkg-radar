@@ -3,6 +3,25 @@ import tailwindcss from '@tailwindcss/vite'
 // https://nuxt.com/docs/api/configuration/nuxt-config
 export default defineNuxtConfig({
   compatibilityDate: '2025-07-15',
+  app: {
+    head: {
+      title: 'BMKG Radar Viewer — Live Weather Radar Indonesia',
+      htmlAttrs: {
+        lang: 'id',
+      },
+      meta: [
+        { charset: 'utf-8' },
+        { name: 'viewport', content: 'width=device-width, initial-scale=1' },
+        { name: 'description', content: 'Live weather radar viewer for BMKG SI-DARMA Indonesia radar stations with real-time reflectivity, station coverage, and nowcast frames.' },
+        { name: 'theme-color', content: '#020617' },
+      ],
+      link: [
+        { rel: 'icon', type: 'image/svg+xml', href: '/favicon.svg' },
+        { rel: 'icon', type: 'image/x-icon', href: '/favicon.ico' },
+        { rel: 'apple-touch-icon', sizes: '180x180', href: '/apple-touch-icon.png' },
+      ],
+    },
+  },
   // Dev-only. Nuxt DevTools adds a client-side overlay and bundle weight,
   // which must not ship to a static deploy.
   //
