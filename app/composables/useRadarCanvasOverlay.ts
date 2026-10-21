@@ -76,6 +76,10 @@ export const useRadarCanvasOverlay = (
     if (!el || !ctx) return
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
     ctx.clearRect(0, 0, el.width, el.height)
+    // Set screen blend mode once for the entire batch. In Safari / WebKit,
+    // switching composite operations or clipping per station inside the loop
+    // forces offscreen GPU render pass breaks and CPU synchronization.
+    ctx.globalCompositeOperation = 'screen'
 
     for (const s of getStations()) {
       const url = resolveFrame(s.id)
@@ -84,15 +88,13 @@ export const useRadarCanvasOverlay = (
       if (!bmp) continue
       const size = s.size
       if (!(size > 0)) continue
-      ctx.save()
       ctx.globalAlpha = s.opacity
-      ctx.globalCompositeOperation = 'screen'
-      ctx.beginPath()
-      ctx.arc(s.x, s.y, size / 2, 0, Math.PI * 2)
-      ctx.clip()
+      // The bitmap is already circular-clipped during downscaling, so we draw directly
       ctx.drawImage(bmp, s.x - size / 2, s.y - size / 2, size, size)
-      ctx.restore()
     }
+
+    ctx.globalAlpha = 1
+    ctx.globalCompositeOperation = 'source-over'
     lastPaint = performance.now()
   }
 
@@ -199,7 +201,15 @@ export const createBitmapScaler = (maxEdge = BITMAP_DEFAULT_EDGE) => {
     canvas.width = w
     canvas.height = h
     ctx.clearRect(0, 0, w, h)
+    // Pre-clip the circular radar footprint ONCE during downscaling.
+    // This allows the 60fps paint() loop to draw directly without per-frame
+    // ctx.clip() calls that cause major frame drops on WebKit / Safari.
+    ctx.save()
+    ctx.beginPath()
+    ctx.arc(w / 2, h / 2, w / 2, 0, Math.PI * 2)
+    ctx.clip()
     ctx.drawImage(img, 0, 0, w, h)
+    ctx.restore()
 
     // Hand back a dedicated canvas holding the downscaled pixels, so the
     // shared scratch canvas can be reused immediately. drawImage accepts an

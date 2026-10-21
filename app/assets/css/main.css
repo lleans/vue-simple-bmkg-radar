@@ -167,3 +167,19 @@ html {
 ::-webkit-scrollbar-thumb:hover {
   background: var(--ring);
 }
+
+/* Hardware acceleration and compositing isolation for Safari / WebKit */
+.maplibregl-canvas,
+canvas.pointer-events-none {
+  transform: translateZ(0);
+  -webkit-transform: translateZ(0);
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+}
+
+/* Ensure backdrop-filter creates efficient composited layers */
+[class*="backdrop-blur"] {
+  transform: translateZ(0);
+  -webkit-transform: translateZ(0);
+  -webkit-backdrop-filter: blur(var(--tw-backdrop-blur, 12px));
+}

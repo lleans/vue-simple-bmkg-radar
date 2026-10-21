@@ -1431,10 +1431,9 @@ const tzAbbrev = computed(() => {
       <div
         v-for="s in visibleStations"
         :key="s.id"
-        class="absolute -translate-x-1/2 -translate-y-1/2 will-change-transform"
+        class="absolute will-change-transform"
         :style="{
-          left: `${posOf(s.id).x}px`,
-          top: `${posOf(s.id).y}px`,
+          transform: `translate3d(${posOf(s.id).x}px, ${posOf(s.id).y}px, 0) translate(-50%, -50%)`,
           width: `${
             (viewMode === 'selected' && s.id !== selectedStationId
               ? posOf(s.id).size * 0.55

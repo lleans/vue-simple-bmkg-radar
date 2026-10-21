@@ -18,16 +18,28 @@ const trackStyle = computed(() => ({
   height: `calc(100vh + ${maxScroll.value}px)`,
 }))
 
-const cardStyle = computed(() => ({
-  transform: `scale(${scale.value})`,
-  // Rounded clip driven by the scroll progress, so the corners tighten
-  // as the card shrinks.
-  borderRadius: `${radius.value}px`,
-  // clip-path clips the whole subtree, including the WebGL map canvas,
-  // which `corner-shape` on its own does not clip.
-  clipPath: `inset(0 round ${radius.value}px)`,
-  borderColor: `color-mix(in oklab, var(--border) ${progress.value * 100}%, transparent)`,
-}))
+const cardStyle = computed(() => {
+  const p = progress.value
+  const rad = radius.value
+  const sc = scale.value
+
+  // When at top (normal map view):
+  // Do NOT apply clipPath and transform: scale(1) to the entire viewport.
+  // In Safari (WebKit), dynamic clipPath on an ancestor of WebGL and 2D canvas
+  // forces software masking and texture invalidation, dropping frame rates.
+  if (p === 0 || rad === 0) {
+    return {
+      borderColor: 'transparent',
+    }
+  }
+
+  return {
+    transform: `scale(${sc})`,
+    borderRadius: `${rad}px`,
+    clipPath: `inset(0 round ${rad}px)`,
+    borderColor: `color-mix(in oklab, var(--border) ${p * 100}%, transparent)`,
+  }
+})
 
 let frame = 0
 const onScroll = () => {
