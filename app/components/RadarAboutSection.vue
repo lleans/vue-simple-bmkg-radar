@@ -76,7 +76,7 @@ const groupNames = computed(() => {
         <div class="relative overflow-hidden rounded-2xl border border-border/60 bg-muted/30">
           <img
             :src="EXAMPLE_FRAME"
-            alt="A close-up of the radar map over Central Java: one station's circular reflectivity frame in blue and green over the real basemap, with its 240 km coverage circle marked."
+            alt="A close-up of the radar map over East Java: one station's circular reflectivity frame in blue and green over the real basemap, with its 240 km coverage circle marked."
             class="block w-full"
             loading="lazy"
             decoding="async"
