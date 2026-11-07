@@ -55,6 +55,29 @@ const timeseriesResult = ref<RadarTimeseries | null>(null)
 const timeseriesCoords = ref<{ lat: number, lon: number } | null>(null)
 const timeseriesStationId = ref<string | null>(null)
 const timeseriesDateOption = ref<'today' | 'yesterday'>('today')
+const pointMode = ref(false)
+const isSafari = ref(false)
+
+function startPointMode() {
+  pointMode.value = true
+  vcutMode.value = false
+  if (map) map.getCanvas().style.cursor = 'crosshair'
+}
+
+function cancelPointMode() {
+  pointMode.value = false
+  if (map) map.getCanvas().style.cursor = ''
+}
+
+function togglePointMode() {
+  if (pointMode.value) {
+    cancelPointMode()
+  } else if (timeseriesOpen.value) {
+    timeseriesOpen.value = false
+  } else {
+    startPointMode()
+  }
+}
 let map: MaplibreMap | null = null
 
 // 'all' shows every station's frame; 'selected' shows only the picked
@@ -289,11 +312,16 @@ function handleMapClick(e: maplibregl.MapMouseEvent) {
     }
     return
   }
+  if (pointMode.value) {
+    cancelPointMode()
+    void requestTimeseries(e.lngLat)
+    return
+  }
   if (e.originalEvent.altKey) void requestTimeseries(e.lngLat)
 }
 
 function handleMapMove() {
-  if (vcutMode.value && map) map.getCanvas().style.cursor = 'crosshair'
+  if ((vcutMode.value || pointMode.value) && map) map.getCanvas().style.cursor = 'crosshair'
 }
 
 // Client-side image cache with request de-duplication.
@@ -1187,6 +1215,9 @@ function initMap(center: [number, number], zoom: number) {
 }
 
 onMounted(async () => {
+  if (typeof navigator !== 'undefined') {
+    isSafari.value = /^((?!chrome|android).)*safari/i.test(navigator.userAgent)
+  }
   syncIsMobile()
   window.addEventListener('resize', syncIsMobile, { passive: true })
   setupResizeObserver()
@@ -1404,10 +1435,27 @@ const tzAbbrev = computed(() => {
         <HoverCardContent side="top" :side-offset="8" align="start" :collision-padding="12" class="z-40 w-72 max-w-[calc(100vw-1.5rem)] rounded-2xl border border-border/60 bg-popover/95 p-3 text-popover-foreground shadow-2xl backdrop-blur-xl data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[side=bottom]:slide-in-from-top-2 data-[side=top]:slide-in-from-bottom-2">
           <p class="text-xs font-medium">VCUT — vertical cross-section</p>
           <p class="mt-1 text-[11px] leading-relaxed text-muted-foreground">Click this, then tap two points on the map. The radar makes a vertical slice between them (dBZ vs. height) for the latest frame.</p>
-          <p class="mt-2 text-xs font-medium">Point nowcast</p>
-          <p class="mt-1 text-[11px] leading-relaxed text-muted-foreground"><kbd class="rounded border border-border/60 bg-background/40 px-1 py-px font-mono text-[10px]">Alt</kbd> + click any spot on the map to see that point's reflectivity over the last 24 hours (the chosen station).</p>
+          <p class="mt-2 text-xs font-medium">Rain Point & nowcast</p>
+          <p class="mt-1 text-[11px] leading-relaxed text-muted-foreground">Click "Rain Point" or <kbd class="rounded border border-border/60 bg-background/40 px-1 py-px font-mono text-[10px]">Alt</kbd> + click any spot on the map to view rain perception timeseries.</p>
         </HoverCardContent>
       </HoverCardRoot>
+
+      <!-- Rain Point / Perception button -->
+      <button
+        type="button"
+        aria-label="Rain Perception: point radar timeseries"
+        :aria-pressed="pointMode || timeseriesOpen"
+        class="flex h-7 shrink-0 items-center gap-1 rounded-full border px-2 text-[10px] font-medium transition-colors sm:h-8 sm:gap-1.5 sm:px-2.5 sm:text-[11px]"
+        :class="(pointMode || timeseriesOpen) ? 'border-primary bg-primary text-primary-foreground shadow-sm' : 'border-border/60 text-foreground/75 hover:bg-foreground/10'"
+        @click="togglePointMode"
+      >
+        <svg viewBox="0 0 16 16" class="h-3.5 w-3.5 shrink-0" fill="none" stroke="currentColor" stroke-width="1.5">
+          <circle cx="8" cy="8" r="5" stroke-dasharray="2 2" />
+          <circle cx="8" cy="8" r="2" fill="currentColor" />
+        </svg>
+        <span>Rain Point</span>
+      </button>
+
       <RadarTimeRangeBar v-model:mode="mode" />
       <button class="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-foreground/90 text-background transition-transform hover:scale-105 sm:h-8 sm:w-8" :aria-label="playing ? 'Pause' : 'Play'" @click="playing ? pause() : play()">
         <svg v-if="playing" viewBox="0 0 16 16" class="h-3 w-3 fill-current sm:h-3.5 sm:w-3.5"><rect x="3" y="2.5" width="3" height="11" rx="0.5" /><rect x="10" y="2.5" width="3" height="11" rx="0.5" /></svg>
@@ -1421,7 +1469,7 @@ const tzAbbrev = computed(() => {
         min="0"
         :max="Math.max(0, totalFrames - 1)"
         :value="frameIdx"
-        class="radar-scrubber-pill min-w-0 flex-1"
+        :class="['radar-scrubber-pill min-w-0 flex-1', isSafari ? 'thumb-pill' : '']"
         @input="handleSeek"
       >
       <span class="hidden w-16 shrink-0 text-right text-[11px] tabular-nums text-foreground/60 sm:inline">{{ playheadLabel }} / {{ totalFrames }}</span>
@@ -1477,7 +1525,7 @@ const tzAbbrev = computed(() => {
           <div>
             <div class="flex items-center gap-2">
               <span class="inline-block size-2 rounded-full bg-primary" />
-              <p class="text-sm font-semibold tracking-tight">Point radar timeseries</p>
+              <p class="text-sm font-semibold tracking-tight">Rain Perception · Point Timeseries</p>
             </div>
             <p v-if="timeseriesCoords" class="mt-0.5 font-mono text-[11px] text-muted-foreground">
               {{ timeseriesCoords.lat >= 0 ? '+' : '' }}{{ timeseriesCoords.lat.toFixed(3) }}°,
@@ -1623,6 +1671,15 @@ const tzAbbrev = computed(() => {
         <div class="rounded-full border border-border/60 bg-card/90 px-3 py-1.5 text-center text-xs shadow-lg backdrop-blur-md">
           {{ vcutStart ? 'Tap the second point to finish the vertical cut' : 'Tap the first point of the vertical cut' }}
           <button type="button" class="pointer-events-auto ml-2 rounded-full px-1 text-muted-foreground hover:bg-foreground/10" @click="cancelVcut">Cancel</button>
+        </div>
+      </div>
+    </Transition>
+
+    <Transition name="pill">
+      <div v-if="pointMode" class="pointer-events-none absolute inset-x-3 top-3 z-20 flex justify-center sm:inset-x-4 sm:top-4">
+        <div class="rounded-full border border-border/60 bg-card/90 px-3 py-1.5 text-center text-xs shadow-lg backdrop-blur-md">
+          <span>Click any point on the map to sample rain perception</span>
+          <button type="button" class="pointer-events-auto ml-2 rounded-full px-1.5 text-muted-foreground hover:bg-foreground/10" @click="cancelPointMode">Cancel</button>
         </div>
       </div>
     </Transition>

@@ -177,7 +177,7 @@ canvas.pointer-events-none {
   -webkit-backface-visibility: hidden;
 }
 
-/* --- Pill scrubber slider for Safari / WebKit & modern browsers --- */
+/* --- Scrubber slider: round on Chrome, pill on Safari --- */
 .radar-scrubber-pill {
   -webkit-appearance: none;
   appearance: none;
@@ -202,16 +202,17 @@ canvas.pointer-events-none {
   cursor: pointer;
 }
 
+/* Chrome and Chromium browsers: round circular thumb */
 .radar-scrubber-pill::-webkit-slider-thumb {
   -webkit-appearance: none;
   appearance: none;
-  width: 16px;
-  height: 10px;
-  border-radius: 9999px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
   background: var(--foreground);
   cursor: grab;
   box-shadow: 0 1px 4px color-mix(in oklab, var(--background) 30%, black 70%);
-  margin-top: -2px; /* Centers 10px thumb on 6px track */
+  margin-top: -4px; /* Centers 14px thumb on 6px track */
   transition: transform 0.15s ease, background-color 0.15s ease;
 }
 
@@ -224,6 +225,24 @@ canvas.pointer-events-none {
   transform: scale(1.25);
 }
 
+/* Safari specific: horizontal pill capsule thumb (via JS class or pure WebKit @supports) */
+.is-safari .radar-scrubber-pill::-webkit-slider-thumb,
+.radar-scrubber-pill.thumb-pill::-webkit-slider-thumb {
+  width: 18px;
+  height: 10px;
+  border-radius: 9999px;
+  margin-top: -2px; /* Centers 10px thumb on 6px track */
+}
+
+@supports (-webkit-appearance: -apple-pay-button) {
+  .radar-scrubber-pill::-webkit-slider-thumb {
+    width: 18px;
+    height: 10px;
+    border-radius: 9999px;
+    margin-top: -2px;
+  }
+}
+
 .radar-scrubber-pill::-moz-range-track {
   width: 100%;
   height: 6px;
@@ -233,9 +252,9 @@ canvas.pointer-events-none {
 }
 
 .radar-scrubber-pill::-moz-range-thumb {
-  width: 16px;
-  height: 10px;
-  border-radius: 9999px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
   border: none;
   background: var(--foreground);
   cursor: grab;
