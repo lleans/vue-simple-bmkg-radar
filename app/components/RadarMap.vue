@@ -514,14 +514,19 @@ function refreshProjections() {
   const canvas = map.getCanvas()
   const w = canvas.clientWidth
   const h = canvas.clientHeight
-  viewportSize.value = { w, h }
+  if (w !== viewportSize.value.w || h !== viewportSize.value.h) viewportSize.value = { w, h }
+  const prev = overlayPos.value
   const next: Record<string, { x: number; y: number; size: number }> = {}
+  let changed = Object.keys(prev).length !== stations.value.length
   for (const s of stations.value) {
     // MapLibre's own projection: exactly where the basemap draws this coordinate.
     const p = map.project([s.lon, s.lat])
-    next[s.id] = { x: p.x, y: p.y, size: frameSizePx(map, s.lon, s.lat) }
+    const size = frameSizePx(map, s.lon, s.lat)
+    const old = prev[s.id]
+    if (!old || old.x !== p.x || old.y !== p.y || old.size !== size) changed = true
+    next[s.id] = { x: p.x, y: p.y, size }
   }
-  overlayPos.value = next
+  if (changed) overlayPos.value = next
   // Repaint in the same frame the positions changed, so the radar tracks
   // the map exactly instead of trailing it while the basemap slides.
   repaintOverlay()
@@ -866,6 +871,16 @@ function stationFrameReady(stationId: string): boolean {
   const entry = imageCache.get(url)
   return !!entry && entry.done && !entry.failed && !!entry.bitmap
 }
+
+// Per-station render flags, computed once per tick instead of re-running the
+// frame lookup for every station in the template on each render.
+const stationStatus = computed(() => {
+  const out: Record<string, { ready: boolean, noData: boolean }> = {}
+  for (const s of visibleStations.value) {
+    out[s.id] = { ready: stationFrameReady(s.id), noData: stationHasNoData(s.id) }
+  }
+  return out
+})
 
 // A station has NO DATA when its feed offers no real observation for the
 // current tick — the upstream returns a 1x1 "nodata" placeholder, or the
@@ -1452,7 +1467,7 @@ const tzAbbrev = computed(() => {
                that is still being fetched. It disappears once the frame is
                decoded, leaving just the dot. -->
           <div
-            v-if="!stationFrameReady(s.id) && !stationHasNoData(s.id)"
+            v-if="!stationStatus[s.id]?.ready && !stationStatus[s.id]?.noData"
             class="absolute inset-0 rounded-full border border-dashed border-foreground/30"
           />
           <!-- Hit area for hover. It is taller than the dot so the pointer can
@@ -1465,7 +1480,7 @@ const tzAbbrev = computed(() => {
           >
             <span
               class="h-1.5 w-1.5 rounded-full sm:h-2 sm:w-2"
-              :class="stationHasNoData(s.id)
+              :class="stationStatus[s.id]?.noData
                 ? 'bg-yellow-400'
                 : 'bg-foreground shadow-[0_0_6px_2px_oklab(1_0_0/0.55)]'"
             />
@@ -1487,7 +1502,7 @@ const tzAbbrev = computed(() => {
                 <span class="font-mono">{{ s.id }}</span>
                 <span class="text-foreground/60">· {{ s.name }}</span>
                 <span
-                  v-if="stationHasNoData(s.id)"
+                  v-if="stationStatus[s.id]?.noData"
                   class="rounded-full bg-amber-400/15 px-1.5 py-px text-[10px] font-medium text-amber-500"
                 >No data</span>
               </div>
