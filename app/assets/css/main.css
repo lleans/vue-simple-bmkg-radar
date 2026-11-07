@@ -202,17 +202,17 @@ canvas.pointer-events-none {
   cursor: pointer;
 }
 
-/* Chrome and Chromium browsers: round circular thumb */
+/* Chrome and Chromium browsers: round circular thumb (bigger size) */
 .radar-scrubber-pill::-webkit-slider-thumb {
   -webkit-appearance: none;
   appearance: none;
-  width: 14px;
-  height: 14px;
+  width: 18px;
+  height: 18px;
   border-radius: 50%;
   background: var(--foreground);
   cursor: grab;
-  box-shadow: 0 1px 4px color-mix(in oklab, var(--background) 30%, black 70%);
-  margin-top: -4px; /* Centers 14px thumb on 6px track */
+  box-shadow: 0 1px 5px color-mix(in oklab, var(--background) 30%, black 70%);
+  margin-top: -6px; /* Centers 18px thumb on 6px track */
   transition: transform 0.15s ease, background-color 0.15s ease;
 }
 
@@ -225,21 +225,21 @@ canvas.pointer-events-none {
   transform: scale(1.25);
 }
 
-/* Safari specific: horizontal pill capsule thumb (via JS class or pure WebKit @supports) */
+/* Safari specific: horizontal pill capsule thumb (bigger size) */
 .is-safari .radar-scrubber-pill::-webkit-slider-thumb,
 .radar-scrubber-pill.thumb-pill::-webkit-slider-thumb {
-  width: 18px;
-  height: 10px;
+  width: 26px;
+  height: 14px;
   border-radius: 9999px;
-  margin-top: -2px; /* Centers 10px thumb on 6px track */
+  margin-top: -4px; /* Centers 14px thumb on 6px track */
 }
 
 @supports (-webkit-appearance: -apple-pay-button) {
   .radar-scrubber-pill::-webkit-slider-thumb {
-    width: 18px;
-    height: 10px;
+    width: 26px;
+    height: 14px;
     border-radius: 9999px;
-    margin-top: -2px;
+    margin-top: -4px;
   }
 }
 
@@ -252,13 +252,13 @@ canvas.pointer-events-none {
 }
 
 .radar-scrubber-pill::-moz-range-thumb {
-  width: 14px;
-  height: 14px;
+  width: 18px;
+  height: 18px;
   border-radius: 50%;
   border: none;
   background: var(--foreground);
   cursor: grab;
-  box-shadow: 0 1px 4px color-mix(in oklab, var(--background) 30%, black 70%);
+  box-shadow: 0 1px 5px color-mix(in oklab, var(--background) 30%, black 70%);
   transition: transform 0.15s ease;
 }
 

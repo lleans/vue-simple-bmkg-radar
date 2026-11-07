@@ -100,6 +100,34 @@ const vcutEndScreen = computed(() => {
   return { x: p.x, y: p.y }
 })
 
+const timeseriesScreen = computed(() => {
+  void overlayPos.value
+  if (!map || !timeseriesCoords.value) return null
+  const p = map.project([timeseriesCoords.value.lon, timeseriesCoords.value.lat])
+  return { x: p.x, y: p.y }
+})
+
+// Haversine distance in km between two [lon, lat] points
+function geoDistanceKm(lon1: number, lat1: number, lon2: number, lat2: number): number {
+  const R = 6371
+  const dLat = (lat2 - lat1) * Math.PI / 180
+  const dLon = (lon2 - lon1) * Math.PI / 180
+  const a = Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+    Math.sin(dLon / 2) ** 2
+  return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+}
+
+// Stations whose 250km radar coverage intersects the sampled point
+const intersectingStations = computed(() => {
+  if (!timeseriesCoords.value) return []
+  const { lat, lon } = timeseriesCoords.value
+  return stations.value
+    .map(s => ({ ...s, distKm: geoDistanceKm(lon, lat, s.lon, s.lat) }))
+    .filter(s => s.distKm <= STATION_RADIUS_KM)
+    .sort((a, b) => a.distKm - b.distKm)
+})
+
 const DEFAULT_VIEW = { center: [118, -2.5] as [number, number], zoom: 4 }
 // Zoom for a located visitor: a region with nearby radars, not the country.
 const LOCAL_ZOOM = 7
@@ -242,11 +270,16 @@ async function requestTimeseries(lngLat?: { lat: number, lng: number }) {
   }
   if (!timeseriesCoords.value) return
 
-  // Automatically select nearest radar station if none is picked
-  if (!timeseriesStationId.value) {
-    if (selectedStationId.value) {
-      timeseriesStationId.value = selectedStationId.value
-    } else {
+  // Automatically select the nearest intersecting radar station covering this point
+  const inter = intersectingStations.value
+  if (inter.length > 0) {
+    // If current station does not intersect this point, pick the closest intersecting one
+    if (!timeseriesStationId.value || !inter.some(s => s.id === timeseriesStationId.value)) {
+      timeseriesStationId.value = inter[0]?.id ?? null
+    }
+  } else {
+    // Fallback if point is outside all coverage rings
+    if (!timeseriesStationId.value) {
       const nearest = vcutStationFor(
         [timeseriesCoords.value.lon, timeseriesCoords.value.lat],
         [timeseriesCoords.value.lon, timeseriesCoords.value.lat],
@@ -660,7 +693,16 @@ function updateVisible() {
   for (const s of stations.value) {
     const p = overlayPos.value[s.id]
     if (!p) continue
-    if (p.x < -VIEW_MARGIN_PX || p.x > w + VIEW_MARGIN_PX || p.y < -VIEW_MARGIN_PX || p.y > h + VIEW_MARGIN_PX) continue
+    // Check intersection of the station radar footprint (radius = size / 2)
+    // with the active viewport (expanded by VIEW_MARGIN_PX).
+    // This guarantees that when zoomed in on an area covered by the radar,
+    // the radar imagery continues to load and render even if the center dot
+    // is outside the visible screen.
+    const radius = p.size / 2
+    if (p.x + radius < -VIEW_MARGIN_PX || p.x - radius > w + VIEW_MARGIN_PX ||
+        p.y + radius < -VIEW_MARGIN_PX || p.y - radius > h + VIEW_MARGIN_PX) {
+      continue
+    }
     next.add(s.id)
   }
   if (!sameSet(visibleIds.value, next)) visibleIds.value = next
@@ -1373,6 +1415,18 @@ const tzAbbrev = computed(() => {
       </svg>
       <span v-if="vcutStartScreen" class="absolute h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white bg-rose-500 shadow-lg" :style="{ left: `${vcutStartScreen.x}px`, top: `${vcutStartScreen.y}px` }" />
       <span v-if="vcutEndScreen" class="absolute h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white bg-rose-500 shadow-lg" :style="{ left: `${vcutEndScreen.x}px`, top: `${vcutEndScreen.y}px` }" />
+
+      <!-- Rain Point sample marker -->
+      <div
+        v-if="timeseriesOpen && timeseriesScreen"
+        class="pointer-events-none absolute -translate-x-1/2 -translate-y-1/2 transition-transform duration-75"
+        :style="{ left: `${timeseriesScreen.x}px`, top: `${timeseriesScreen.y}px` }"
+      >
+        <span class="absolute -inset-2 animate-ping rounded-full bg-primary/30" />
+        <span class="relative flex size-5 items-center justify-center rounded-full border-2 border-background bg-primary text-primary-foreground shadow-xl ring-2 ring-primary/40">
+          <span class="size-1.5 rounded-full bg-background" />
+        </span>
+      </div>
     </div>
 
     <Transition name="pill">
@@ -1573,15 +1627,26 @@ const tzAbbrev = computed(() => {
           </div>
 
           <div v-if="stations.length" class="flex items-center gap-1.5">
-            <span class="text-[11px] text-muted-foreground">Station:</span>
+            <span class="text-[11px] text-muted-foreground">Radar:</span>
             <select
               :value="timeseriesStationId"
               class="rounded-lg border border-border/60 bg-background/80 px-2 py-0.5 font-mono text-[11px] text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
               @change="setTimeseriesStation(($event.target as HTMLSelectElement).value)"
             >
-              <option v-for="s in stations" :key="s.id" :value="s.id">
-                {{ s.id }} - {{ s.name }}
-              </option>
+              <optgroup v-if="intersectingStations.length" label="In range (<= 250km)">
+                <option v-for="s in intersectingStations" :key="s.id" :value="s.id">
+                  {{ s.id }} – {{ s.name }} ({{ Math.round(s.distKm) }} km)
+                </option>
+              </optgroup>
+              <optgroup v-if="intersectingStations.length < stations.length" label="Other stations">
+                <option
+                  v-for="s in stations.filter(st => !intersectingStations.some(i => i.id === st.id))"
+                  :key="s.id"
+                  :value="s.id"
+                >
+                  {{ s.id }} – {{ s.name }}
+                </option>
+              </optgroup>
             </select>
           </div>
         </div>
