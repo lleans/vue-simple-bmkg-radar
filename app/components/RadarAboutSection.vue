@@ -320,8 +320,30 @@ const groupNames = computed(() => {
         </div>
       </div>
 
+      <!-- BMKG Logo (pre-processed static images: white in dark theme, dark in light theme) -->
+      <div class="mt-20 flex flex-col items-center justify-center">
+        <div class="mb-4 flex items-center justify-center">
+          <!-- Light theme: dark logo -->
+          <img
+            src="/images/bmkg-logo-dark.png"
+            alt="BMKG - Badan Meteorologi, Klimatologi, dan Geofisika"
+            class="h-12 w-auto object-contain opacity-70 transition-opacity hover:opacity-100 dark:hidden"
+            loading="lazy"
+            decoding="async"
+          >
+          <!-- Dark theme: white logo -->
+          <img
+            src="/images/bmkg-logo-white.png"
+            alt="BMKG - Badan Meteorologi, Klimatologi, dan Geofisika"
+            class="hidden h-12 w-auto object-contain opacity-70 transition-opacity hover:opacity-100 dark:block"
+            loading="lazy"
+            decoding="async"
+          >
+        </div>
+      </div>
+
       <!-- Attribution -->
-      <div class="mt-16 rounded-2xl border border-border/60 bg-card/60 p-5">
+      <div class="rounded-2xl border border-border/60 bg-card/60 p-5">
         <p class="text-[13px] leading-relaxed text-muted-foreground">
           Radar imagery and product descriptions are the work of
           <a
