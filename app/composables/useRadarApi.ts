@@ -27,7 +27,8 @@ export interface RadarProduct {
 }
 
 export interface RadarTimeseriesPoint {
-  label: string
+  time_utc?: string | null
+  label?: string
   value: number
   color: string | null
 }

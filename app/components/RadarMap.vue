@@ -52,6 +52,9 @@ const timeseriesOpen = ref(false)
 const timeseriesLoading = ref(false)
 const timeseriesError = ref('')
 const timeseriesResult = ref<RadarTimeseries | null>(null)
+const timeseriesCoords = ref<{ lat: number, lon: number } | null>(null)
+const timeseriesStationId = ref<string | null>(null)
+const timeseriesDateOption = ref<'today' | 'yesterday'>('today')
 let map: MaplibreMap | null = null
 
 // 'all' shows every station's frame; 'selected' shows only the picked
@@ -182,27 +185,95 @@ function friendlyVcutError(e: unknown): string {
   return 'Could not generate vertical cut. Please try again.'
 }
 
-async function requestTimeseries(lngLat: { lat: number, lng: number }) {
-  if (!selectedStationId.value) {
-    timeseriesError.value = 'Select a radar station first.'
+function getUtcDateCompact(offsetDays = 0): string {
+  const d = new Date(Date.now() - offsetDays * 86_400_000)
+  return `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}${String(d.getUTCDate()).padStart(2, '0')}`
+}
+
+function friendlyTimeseriesError(e: unknown): string {
+  const raw = (e instanceof Error ? e.message : String(e)) || ''
+  if (/upstream status 500|upstream_unavailable/i.test(raw)) {
+    return 'BMKG upstream has no point observation for this station/date. Try switching to yesterday or another station.'
+  }
+  if (/Failed to fetch|NetworkError/i.test(raw)) {
+    return 'Could not reach the radar proxy. Check your connection and try again.'
+  }
+  return raw.replace(/^\[GET\]\s*"?[^"]*"?\s*/i, '').replace(/\s*<no response>\s*$/i, '').trim() || 'Could not load point timeseries.'
+}
+
+function formatTimeseriesTime(p: RadarTimeseriesPoint): string {
+  if (p.time_utc) {
+    try {
+      const d = new Date(p.time_utc)
+      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })
+    } catch {
+      // fallback to label
+    }
+  }
+  return p.label || '--:--'
+}
+
+async function requestTimeseries(lngLat?: { lat: number, lng: number }) {
+  if (lngLat) {
+    timeseriesCoords.value = { lat: lngLat.lat, lon: lngLat.lng }
+  }
+  if (!timeseriesCoords.value) return
+
+  // Automatically select nearest radar station if none is picked
+  if (!timeseriesStationId.value) {
+    if (selectedStationId.value) {
+      timeseriesStationId.value = selectedStationId.value
+    } else {
+      const nearest = vcutStationFor(
+        [timeseriesCoords.value.lon, timeseriesCoords.value.lat],
+        [timeseriesCoords.value.lon, timeseriesCoords.value.lat],
+      )
+      timeseriesStationId.value = nearest?.id ?? stations.value[0]?.id ?? null
+    }
+  }
+
+  if (!timeseriesStationId.value) {
+    timeseriesError.value = 'Radar station list is still loading.'
     timeseriesOpen.value = true
     return
   }
+
   timeseriesOpen.value = true
   timeseriesLoading.value = true
   timeseriesError.value = ''
   timeseriesResult.value = null
-  const date = new Date().toISOString().slice(0, 10).replaceAll('-', '')
-  const params = new URLSearchParams({ lat: String(lngLat.lat), lon: String(lngLat.lng), date })
+
+  const date = getUtcDateCompact(timeseriesDateOption.value === 'yesterday' ? 1 : 0)
+  const params = new URLSearchParams({
+    lat: timeseriesCoords.value.lat.toFixed(4),
+    lon: timeseriesCoords.value.lon.toFixed(4),
+    date,
+  })
+
   try {
-    const res = await $fetch<RadarEnvelope<RadarTimeseries>>(`${base}/api/timeseries/${selectedStationId.value}?${params}`)
-    if (!res.ok) throw new Error(res.message ?? res.error ?? 'Could not load point forecast.')
+    const res = await $fetch<RadarEnvelope<RadarTimeseries>>(
+      `${base}/api/timeseries/${timeseriesStationId.value}?${params}`,
+    )
+    if (!res.ok) throw new Error(res.message ?? res.error ?? 'Could not load point timeseries.')
     timeseriesResult.value = res.data
   } catch (e) {
-    timeseriesError.value = e instanceof Error ? e.message : 'Could not load point forecast.'
+    console.warn('[radar] timeseries failed', e)
+    timeseriesError.value = friendlyTimeseriesError(e)
   } finally {
     timeseriesLoading.value = false
   }
+}
+
+function setTimeseriesDate(option: 'today' | 'yesterday') {
+  if (timeseriesDateOption.value === option) return
+  timeseriesDateOption.value = option
+  void requestTimeseries()
+}
+
+function setTimeseriesStation(id: string) {
+  if (timeseriesStationId.value === id) return
+  timeseriesStationId.value = id
+  void requestTimeseries()
 }
 
 function handleMapClick(e: maplibregl.MapMouseEvent) {
@@ -542,16 +613,6 @@ function rafRefresh() {
 // are never requested. Opening on the visitor's region therefore loads a
 // handful of radars instead of all 50.
 const VIEW_MARGIN_PX = 120 // pre-load a little past the edge so short pans feel instant
-// How much of a station's footprint (in CSS px) must land on screen before we
-// fetch its 11 frames. A frame is ~500 km across, so a neighbour whose circle
-// only grazes the edge costs a full set of downloads for a sliver.
-//
-// This is an absolute area, NOT a fraction of the frame: a fraction inverts
-// exactly when you zoom in, because the frame grows with the map while the
-// viewport does not. (A frame-fraction test made every station disappear at
-// close zoom.) 4000 px ~= a 63 px edge — enough to see the echo arrive, far
-// less than the ~500 px slivers worth skipping.
-const MIN_VISIBLE_AREA_PX = 4000
 const visibleIds = shallowRef<Set<string>>(new Set())
 // False until the start view is decided, so the default country view can't
 // trigger a whole-country load before we know where the visitor is.
@@ -571,13 +632,8 @@ function updateVisible() {
   for (const s of stations.value) {
     const p = overlayPos.value[s.id]
     if (!p) continue
-    const r = p.size / 2 + VIEW_MARGIN_PX
-    if (p.x + r < 0 || p.x - r > w || p.y + r < 0 || p.y - r > h) continue
-    // Overlap test passed; now require a useful amount of footprint.
-    const half = Math.max(1, p.size / 2)
-    const overlapW = Math.min(p.x + half, w) - Math.max(p.x - half, 0)
-    const overlapH = Math.min(p.y + half, h) - Math.max(p.y - half, 0)
-    if (overlapW * overlapH >= MIN_VISIBLE_AREA_PX) next.add(s.id)
+    if (p.x < -VIEW_MARGIN_PX || p.x > w + VIEW_MARGIN_PX || p.y < -VIEW_MARGIN_PX || p.y > h + VIEW_MARGIN_PX) continue
+    next.add(s.id)
   }
   if (!sameSet(visibleIds.value, next)) visibleIds.value = next
 }
@@ -805,6 +861,7 @@ function targetFrameFor(stationId: string, index: number): RadarFrame | null {
 
 function warmVisible() {
   for (const id of visibleIds.value) {
+    if (isStaleLive(id)) continue
     for (let off = 0; off <= WARM_AHEAD; off++) {
       const f = targetFrameFor(id, frameIdx.value + off)
       if (f?.url) loadImage(f.url)
@@ -820,6 +877,7 @@ watch([visibleIds, productsByStation, frameIdx, mode, () => archive.frames.value
 function frameFor(stationId: string): string | null {
   const target = targetFrameFor(stationId, frameIdx.value)
   if (!target?.url) return null
+  if (isStaleLive(stationId)) return null
   const ready = (url: string) => {
     const entry = imageCache.get(url)
     return !!entry && entry.done && !entry.failed && !!entry.bitmap
@@ -886,19 +944,30 @@ const stationStatus = computed(() => {
 // current tick — the upstream returns a 1x1 "nodata" placeholder, or the
 // feed is stale (hours/days old). This is different from "still loading":
 // a station whose image is on its way is LOADING, not empty.
+// The feed's newest observation is more than the playback window behind the
+// current live tick. Such frames are not drawn: showing them next to a "No data"
+// label would contradict it.
+function isStaleLive(stationId: string): boolean {
+  if (mode.value !== 'live') return false
+  const frames = stationFrames(stationId)
+  if (!frames.length) return true
+  const newest = frameTime(frames[frames.length - 1]!)
+  if (!newest) return true
+  return liveTickTime(frameIdx.value) - newest > LIVE_WINDOW_MS
+}
+
 function stationHasNoData(stationId: string): boolean {
   const target = targetFrameFor(stationId, frameIdx.value)
   if (!target?.url) return true
   if (/\/nodata\.png(?:$|\?)/i.test(target.url)) return true
-  // The feed's newest observation is far older than the playback window.
-  const frames = stationFrames(stationId)
-  if (!frames.length) return true
-  const newest = frameTime(frames[frames.length - 1]!)
-  const targetTime = mode.value === 'archive'
-    ? Date.parse(target.time_utc)
-    : liveTickTime(frameIdx.value)
-  if (!newest || !Number.isFinite(targetTime)) return true
-  return targetTime - newest > LIVE_WINDOW_MS
+  if (mode.value !== 'live') {
+    const targetTime = Date.parse(target.time_utc)
+    const frames = stationFrames(stationId)
+    const newest = frames.length ? frameTime(frames[frames.length - 1]!) : null
+    if (!newest || !Number.isFinite(targetTime)) return true
+    return targetTime - newest > LIVE_WINDOW_MS
+  }
+  return isStaleLive(stationId)
 }
 
 // Canvas overlay: one <canvas> for all station frames, instead of one
@@ -1345,7 +1414,16 @@ const tzAbbrev = computed(() => {
         <svg v-else viewBox="0 0 16 16" class="h-3 w-3 fill-current sm:h-3.5 sm:w-3.5"><path d="M4 2.5L13 8L4 13.5V2.5Z" /></svg>
       </button>
       <span class="hidden w-12 shrink-0 text-center font-mono text-[11px] tabular-nums text-foreground/70 sm:inline">{{ currentTimeLabel }} {{ tzAbbrev }}</span>
-      <input type="range" name="radar-frame" aria-label="Radar frame" min="0" :max="Math.max(0, totalFrames - 1)" :value="frameIdx" @input="handleSeek" class="h-1 min-w-0 flex-1 cursor-pointer appearance-none rounded-full bg-foreground/15 accent-foreground" />
+      <input
+        type="range"
+        name="radar-frame"
+        aria-label="Radar frame"
+        min="0"
+        :max="Math.max(0, totalFrames - 1)"
+        :value="frameIdx"
+        class="radar-scrubber-pill min-w-0 flex-1"
+        @input="handleSeek"
+      >
       <span class="hidden w-16 shrink-0 text-right text-[11px] tabular-nums text-foreground/60 sm:inline">{{ playheadLabel }} / {{ totalFrames }}</span>
       <span v-if="isForecast" class="shrink-0 rounded-full bg-foreground/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-foreground/70">Forecast</span>
       <button type="button" class="shrink-0 rounded-full border border-border/60 px-2 py-1 text-[11px] font-medium tabular-nums text-foreground/75 transition-colors hover:bg-foreground/10 hover:text-foreground" aria-label="Animation speed" @click="cycleSpeed">{{ speedLabel }}</button>
@@ -1391,30 +1469,151 @@ const tzAbbrev = computed(() => {
     </Transition>
 
     <Transition name="pill">
-      <div v-if="timeseriesOpen" class="absolute left-3 right-3 top-16 z-30 mx-auto max-w-lg rounded-2xl border border-border/60 bg-card/95 p-3 shadow-2xl backdrop-blur-xl sm:left-1/2 sm:right-auto sm:w-[min(32rem,calc(100%-2rem))] sm:-translate-x-1/2">
-        <div class="flex items-start justify-between gap-3">
+      <div
+        v-if="timeseriesOpen"
+        class="absolute left-3 right-3 top-16 z-30 mx-auto max-w-lg rounded-2xl border border-border/60 bg-card/95 p-4 shadow-2xl backdrop-blur-xl sm:left-1/2 sm:right-auto sm:w-[min(34rem,calc(100%-2rem))] sm:-translate-x-1/2"
+      >
+        <div class="flex items-start justify-between gap-3 border-b border-border/40 pb-3">
           <div>
-            <p class="text-sm font-medium">Point radar time series</p>
-            <p class="mt-0.5 text-[11px] text-muted-foreground">Alt-click a location on the map. Select a station first.</p>
+            <div class="flex items-center gap-2">
+              <span class="inline-block size-2 rounded-full bg-primary" />
+              <p class="text-sm font-semibold tracking-tight">Point radar timeseries</p>
+            </div>
+            <p v-if="timeseriesCoords" class="mt-0.5 font-mono text-[11px] text-muted-foreground">
+              {{ timeseriesCoords.lat >= 0 ? '+' : '' }}{{ timeseriesCoords.lat.toFixed(3) }}°,
+              {{ timeseriesCoords.lon >= 0 ? '+' : '' }}{{ timeseriesCoords.lon.toFixed(3) }}°
+              <span v-if="timeseriesStationId" class="text-foreground/75">· Anchor: {{ timeseriesStationId }}</span>
+            </p>
+            <p v-else class="mt-0.5 text-[11px] text-muted-foreground">
+              Alt-click anywhere on the map to sample that point.
+            </p>
           </div>
-          <button type="button" aria-label="Close point nowcast" class="rounded-full px-2 py-0.5 text-muted-foreground hover:bg-foreground/10" @click="timeseriesOpen = false">×</button>
+          <button
+            type="button"
+            aria-label="Close point timeseries"
+            class="rounded-full p-1 text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
+            @click="timeseriesOpen = false"
+          >
+            <svg viewBox="0 0 16 16" class="size-4" fill="none" stroke="currentColor" stroke-width="1.75">
+              <path d="M4 4l8 8M12 4l-8 8" stroke-linecap="round" />
+            </svg>
+          </button>
         </div>
-        <p v-if="timeseriesLoading" class="py-5 text-center text-xs text-muted-foreground">Loading point data…</p>
-        <p v-else-if="timeseriesError" class="py-5 text-center text-xs text-destructive">{{ timeseriesError }}</p>
+
+        <!-- Timeseries API Controls: Station & Date Picker -->
+        <div class="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs">
+          <div class="flex items-center gap-1.5">
+            <span class="text-[11px] text-muted-foreground">Date:</span>
+            <div class="inline-flex rounded-full border border-border/60 bg-foreground/5 p-0.5">
+              <button
+                type="button"
+                class="rounded-full px-2.5 py-0.5 text-[11px] font-medium transition-colors"
+                :class="timeseriesDateOption === 'today' ? 'bg-primary text-primary-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'"
+                @click="setTimeseriesDate('today')"
+              >
+                Today
+              </button>
+              <button
+                type="button"
+                class="rounded-full px-2.5 py-0.5 text-[11px] font-medium transition-colors"
+                :class="timeseriesDateOption === 'yesterday' ? 'bg-primary text-primary-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'"
+                @click="setTimeseriesDate('yesterday')"
+              >
+                Yesterday
+              </button>
+            </div>
+          </div>
+
+          <div v-if="stations.length" class="flex items-center gap-1.5">
+            <span class="text-[11px] text-muted-foreground">Station:</span>
+            <select
+              :value="timeseriesStationId"
+              class="rounded-lg border border-border/60 bg-background/80 px-2 py-0.5 font-mono text-[11px] text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+              @change="setTimeseriesStation(($event.target as HTMLSelectElement).value)"
+            >
+              <option v-for="s in stations" :key="s.id" :value="s.id">
+                {{ s.id }} - {{ s.name }}
+              </option>
+            </select>
+          </div>
+        </div>
+
+        <div v-if="timeseriesLoading" class="flex flex-col items-center justify-center py-8 text-xs text-muted-foreground">
+          <span class="inline-block size-5 animate-spin rounded-full border-2 border-primary/20 border-t-primary" />
+          <span class="mt-2.5">Fetching point reflectivity from BMKG…</span>
+        </div>
+
+        <div v-else-if="timeseriesError" class="my-4 rounded-xl border border-destructive/40 bg-destructive/5 p-3 text-xs leading-relaxed text-destructive">
+          <p class="font-medium">Point observation unavailable</p>
+          <p class="mt-1 text-[11px] text-muted-foreground">{{ timeseriesError }}</p>
+          <div class="mt-2.5 flex items-center gap-2">
+            <button
+              v-if="timeseriesDateOption === 'today'"
+              type="button"
+              class="rounded-full border border-border/60 bg-foreground/5 px-2.5 py-1 text-[11px] font-medium text-foreground hover:bg-foreground/10"
+              @click="setTimeseriesDate('yesterday')"
+            >
+              Check Yesterday
+            </button>
+            <button
+              type="button"
+              class="rounded-full px-2.5 py-1 text-[11px] font-medium text-muted-foreground hover:bg-foreground/5"
+              @click="requestTimeseries()"
+            >
+              Retry
+            </button>
+          </div>
+        </div>
+
         <div v-else-if="timeseriesResult" class="mt-3">
-          <p class="mb-2 text-[11px] text-muted-foreground">{{ timeseriesResult.station }} · {{ timeseriesResult.date_utc }} · {{ timeseriesResult.units }}</p>
-          <div v-if="timeseriesResult.series.length" class="max-h-56 overflow-y-auto">
-            <div class="flex h-40 items-end gap-1 border-b border-l border-border/60 px-2 pb-1">
-              <div v-for="(p, i) in timeseriesResult.series" :key="`${p.label}-${i}`" class="group relative flex h-full min-w-0 flex-1 flex-col justify-end" :title="`${p.label}: ${p.value} ${timeseriesResult.units}`">
-                <div class="w-full rounded-t-sm opacity-85 transition-opacity group-hover:opacity-100" :style="{ height: `${Math.max(2, Math.min(100, p.value / Math.max(1, ...timeseriesResult.series.map(x => x.value)) * 100))}%`, backgroundColor: p.color || 'var(--primary)' }" />
-                <span v-if="i % Math.max(1, Math.ceil(timeseriesResult.series.length / 8)) === 0" class="absolute -bottom-4 left-1/2 -translate-x-1/2 whitespace-nowrap text-[9px] text-muted-foreground">{{ p.label }}</span>
+          <div class="flex items-center justify-between text-[11px] text-muted-foreground">
+            <span>{{ timeseriesResult.station }} · Date: {{ timeseriesResult.date_utc }} · Units: {{ timeseriesResult.units }}</span>
+            <span v-if="timeseriesResult.series.length" class="font-mono font-medium text-foreground">
+              Peak: {{ Math.max(...timeseriesResult.series.map(x => x.value)) }} {{ timeseriesResult.units }}
+            </span>
+          </div>
+
+          <div v-if="timeseriesResult.series.length" class="mt-2">
+            <div class="flex h-36 items-end gap-1 border-b border-l border-border/60 px-2 pb-1">
+              <div
+                v-for="(p, i) in timeseriesResult.series"
+                :key="`${p.time_utc || p.label || i}-${i}`"
+                class="group relative flex h-full min-w-0 flex-1 flex-col justify-end"
+                :title="`${formatTimeseriesTime(p)}: ${p.value} ${timeseriesResult.units}`"
+              >
+                <div
+                  class="w-full rounded-t-sm opacity-85 transition-opacity group-hover:opacity-100"
+                  :style="{
+                    height: `${Math.max(2, Math.min(100, (p.value / Math.max(1, ...timeseriesResult.series.map(x => x.value))) * 100))}%`,
+                    backgroundColor: p.color || 'var(--primary)',
+                  }"
+                />
+                <span
+                  v-if="i % Math.max(1, Math.ceil(timeseriesResult.series.length / 8)) === 0"
+                  class="absolute -bottom-4 left-1/2 -translate-x-1/2 whitespace-nowrap text-[9px] text-muted-foreground"
+                >
+                  {{ formatTimeseriesTime(p) }}
+                </span>
               </div>
             </div>
-            <div class="mt-6 flex flex-wrap gap-1.5">
-              <span v-for="(p, i) in timeseriesResult.series" :key="`v-${p.label}-${i}`" class="rounded-full bg-foreground/5 px-2 py-0.5 text-[10px] tabular-nums text-muted-foreground">{{ p.label }} · {{ p.value }} {{ timeseriesResult.units }}</span>
+
+            <div class="mt-6 max-h-24 overflow-y-auto">
+              <div class="flex flex-wrap gap-1.5">
+                <span
+                  v-for="(p, i) in timeseriesResult.series"
+                  :key="`chip-${i}`"
+                  class="inline-flex items-center gap-1 rounded-full bg-foreground/5 px-2 py-0.5 text-[10px] tabular-nums text-muted-foreground"
+                >
+                  <span class="size-1.5 rounded-full" :style="{ backgroundColor: p.color || 'var(--primary)' }" />
+                  <span>{{ formatTimeseriesTime(p) }}</span>
+                  <span class="font-semibold text-foreground">{{ p.value }}</span>
+                </span>
+              </div>
             </div>
           </div>
-          <p v-else class="py-5 text-center text-xs text-muted-foreground">No point data is available for today.</p>
+          <p v-else class="py-5 text-center text-xs text-muted-foreground">
+            No point readings recorded for this date.
+          </p>
         </div>
       </div>
     </Transition>

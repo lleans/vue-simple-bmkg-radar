@@ -136,6 +136,57 @@ const groupNames = computed(() => {
             </p>
           </li>
         </ol>
+
+        <!-- Real BMKG radar stations & hardware -->
+        <div class="mt-8 grid gap-4 sm:grid-cols-3">
+          <div class="group overflow-hidden rounded-2xl border border-border/60 bg-card/60 transition-colors hover:border-border">
+            <div class="aspect-[4/3] overflow-hidden bg-muted/40">
+              <img
+                src="/images/radar-tower-station.jpeg"
+                alt="BMKG weather radar station tower with protective radome"
+                class="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
+                loading="lazy"
+                decoding="async"
+              >
+            </div>
+            <div class="p-3.5">
+              <p class="text-xs font-semibold text-foreground">Fixed Radar Tower</p>
+              <p class="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">Permanent BMKG observation tower equipped with a weather radome.</p>
+            </div>
+          </div>
+
+          <div class="group overflow-hidden rounded-2xl border border-border/60 bg-card/60 transition-colors hover:border-border">
+            <div class="aspect-[4/3] overflow-hidden bg-muted/40">
+              <img
+                src="/images/radar-dish-scanning.jpeg"
+                alt="Doppler dual-dish radar antenna mechanism scanning the sky"
+                class="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
+                loading="lazy"
+                decoding="async"
+              >
+            </div>
+            <div class="p-3.5">
+              <p class="text-xs font-semibold text-foreground">Doppler Scanner</p>
+              <p class="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">Dual-dish rotating beam antenna inside the radome measuring radial velocity.</p>
+            </div>
+          </div>
+
+          <div class="group overflow-hidden rounded-2xl border border-border/60 bg-card/60 transition-colors hover:border-border">
+            <div class="aspect-[4/3] overflow-hidden bg-muted/40">
+              <img
+                src="/images/radar-mcrc-mobile.webp"
+                alt="MCRC Mobil Cuaca Respon Cepat - BMKG mobile weather radar truck"
+                class="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
+                loading="lazy"
+                decoding="async"
+              >
+            </div>
+            <div class="p-3.5">
+              <p class="text-xs font-semibold text-foreground">MCRC Mobile Unit</p>
+              <p class="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">Mobil Cuaca Respon Cepat deployed for emergency and targeted field monitoring.</p>
+            </div>
+          </div>
+        </div>
       </div>
 
       <!-- Reading the colours -->
