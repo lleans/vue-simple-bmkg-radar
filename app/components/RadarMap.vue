@@ -338,16 +338,14 @@ async function requestTimeseries(lngLat?: { lat: number, lng: number }) {
   }
   if (!timeseriesCoords.value) return
 
-  // Automatically select the nearest intersecting radar station covering this point
-  const inter = intersectingStations.value
-  if (inter.length > 0) {
-    // If current station does not intersect this point, pick the closest intersecting one
-    if (!timeseriesStationId.value || !inter.some(s => s.id === timeseriesStationId.value)) {
+  // Default to the nearest radar covering the point, but only when the user
+  // has not picked a station. A manual choice is kept even if the point is
+  // outside that station's coverage ring — BMKG still returns data for it.
+  if (!timeseriesStationId.value) {
+    const inter = intersectingStations.value
+    if (inter.length > 0) {
       timeseriesStationId.value = inter[0]?.id ?? null
-    }
-  } else {
-    // Fallback if point is outside all coverage rings
-    if (!timeseriesStationId.value) {
+    } else {
       const nearest = vcutStationFor(
         [timeseriesCoords.value.lon, timeseriesCoords.value.lat],
         [timeseriesCoords.value.lon, timeseriesCoords.value.lat],
