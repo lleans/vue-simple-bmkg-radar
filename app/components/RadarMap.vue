@@ -51,6 +51,7 @@ const vcutResult = ref<RadarVcut | null>(null)
 const timeseriesOpen = ref(false)
 const timeseriesLoading = ref(false)
 const timeseriesError = ref('')
+const timeseriesErrorDetail = ref('')
 const timeseriesResult = ref<RadarTimeseries | null>(null)
 const timeseriesCoords = ref<{ lat: number, lon: number } | null>(null)
 const timeseriesStationId = ref<string | null>(null)
@@ -73,10 +74,16 @@ function togglePointMode() {
   if (pointMode.value) {
     cancelPointMode()
   } else if (timeseriesOpen.value) {
-    timeseriesOpen.value = false
+    closeTimeseries()
   } else {
     startPointMode()
   }
+}
+
+function closeTimeseries() {
+  timeseriesOpen.value = false
+  timeseriesError.value = ''
+  timeseriesErrorDetail.value = ''
 }
 let map: MaplibreMap | null = null
 
@@ -149,6 +156,13 @@ interface RadarEnvelope<T> {
   message?: string
 }
 
+// `ok:false` envelopes normally arrive with HTTP 200, so ofetch resolves
+// instead of throwing. Rethrow them in the shape ofetch uses for non-2xx
+// replies (parsed body on `data`) so both error paths are read the same way.
+function envelopeError(res: RadarEnvelope<unknown>, fallback: string): Error {
+  return Object.assign(new Error(res.message ?? res.error ?? fallback), { data: res })
+}
+
 function formatUtcMinute(date: Date): string {
   return `${date.getUTCFullYear()}${String(date.getUTCMonth() + 1).padStart(2, '0')}${String(date.getUTCDate()).padStart(2, '0')}${String(date.getUTCHours()).padStart(2, '0')}${String(date.getUTCMinutes()).padStart(2, '0')}`
 }
@@ -170,7 +184,7 @@ function startVcut() {
   vcutEnd.value = null
   vcutError.value = ''
   vcutResult.value = null
-  timeseriesOpen.value = false
+  closeTimeseries()
   timeseriesResult.value = null
 }
 
@@ -207,7 +221,7 @@ async function requestVcut(start: [number, number], end: [number, number]) {
       datetime: formatUtcMinute(date),
     })
     const res = await $fetch<RadarEnvelope<RadarVcut>>(`${base}/api/vcut/${station.id}?${params}`)
-    if (!res.ok) throw new Error(res.message ?? res.error ?? 'Could not generate vertical cut.')
+    if (!res.ok) throw envelopeError(res, 'Could not generate vertical cut.')
     if (!res.data?.image_url || /\/nodata\.png(?:$|\?)/i.test(res.data.image_url)) {
       throw new Error('No vertical-cut data is available for that time. Try a different line or a more recent observation.')
     }
@@ -222,18 +236,66 @@ async function requestVcut(start: [number, number], end: [number, number]) {
   }
 }
 
-function friendlyVcutError(e: unknown): string {
-  // Surface a short, user-readable reason. We strip the verbose fetch wrapper
-  // ("[GET] \"...\" <no response> Failed to fetch") but keep any upstream
-  // message so a 400 from the proxy still tells the user why.
-  const raw = (e instanceof Error ? e.message : String(e)) || ''
+interface UpstreamErrorParts {
+  // Best human-readable explanation: the proxy envelope's message, then the
+  // cleaned fetch message, then the proxy's machine code.
+  message: string
+  // Machine-readable code from the proxy envelope (e.g. "upstream_unavailable").
+  code: string
+  // HTTP status of the proxy response, when ofetch reported one.
+  status: number | null
+  // True when the response itself carried something to show. A bare network
+  // failure has none, so the UI can skip the "exact error" pill.
+  hasDetail: boolean
+}
+
+// Nuxt's $fetch (ofetch) throws an error carrying the parsed response body and
+// status for non-2xx replies. Pull the proxy's upstream message and code out of
+// it so the UI can explain WHY the request failed instead of only echoing
+// ofetch's "[GET] <url>: 502 Bad Gateway" wrapper.
+function upstreamErrorParts(e: unknown): UpstreamErrorParts {
+  const err = e as any
+  const data = err?.data
+  const dataMessage = typeof data?.message === 'string' ? data.message.trim() : ''
+  const code = typeof data?.error === 'string' ? data.error.trim() : ''
+  const statusRaw = err?.statusCode ?? err?.status
+  const status = typeof statusRaw === 'number' && Number.isFinite(statusRaw) ? statusRaw : null
+  const raw = (e instanceof Error ? e.message : String(e ?? '')) || ''
   const cleaned = raw
-    .replace(/^\[GET\]\s*"?[^"]*"?\s*/i, '')
+    .replace(/^\[[A-Z]+\]\s*"[^"]*"\s*/i, '')
+    .replace(/^:\s*/, '')
     .replace(/\s*<no response>\s*$/i, '')
     .trim()
-  if (/Failed to fetch|NetworkError/i.test(raw)) return 'Could not reach the radar proxy. Check your connection and try again.'
-  if (cleaned) return cleaned.length > 200 ? cleaned.slice(0, 200) + '…' : cleaned
-  return 'Could not generate vertical cut. Please try again.'
+  return {
+    message: dataMessage || cleaned || code,
+    code,
+    status,
+    hasDetail: !!dataMessage || !!code || status !== null,
+  }
+}
+
+// "HTTP 502 (upstream_unavailable): Upstream status 500: upstream status 500"
+// Empty when the error carries no response detail (e.g. a network failure).
+function formatUpstreamDetail(e: unknown): string {
+  const { message, code, status, hasDetail } = upstreamErrorParts(e)
+  if (!hasDetail) return ''
+  const prefix = [status !== null ? `HTTP ${status}` : '', code ? `(${code})` : '']
+    .filter(Boolean)
+    .join(' ')
+  if (prefix && message && message !== code) return `${prefix}: ${message}`
+  return prefix || message
+}
+
+function friendlyVcutError(e: unknown): string {
+  // Surface a short, user-readable reason, keeping the proxy's own upstream
+  // message (and its code/status) instead of ofetch's "[GET] <url>: 502" text.
+  const { message, code } = upstreamErrorParts(e)
+  if (/Failed to fetch|NetworkError/i.test(`${code} ${message}`)) {
+    return 'Could not reach the radar proxy. Check your connection and try again.'
+  }
+  const text = formatUpstreamDetail(e) || message
+  if (!text) return 'Could not generate vertical cut. Please try again.'
+  return text.length > 200 ? text.slice(0, 200) + '…' : text
 }
 
 function getUtcDateCompact(offsetDays = 0): string {
@@ -242,14 +304,20 @@ function getUtcDateCompact(offsetDays = 0): string {
 }
 
 function friendlyTimeseriesError(e: unknown): string {
-  const raw = (e instanceof Error ? e.message : String(e)) || ''
-  if (/upstream status 500|upstream_unavailable/i.test(raw)) {
-    return 'BMKG upstream has no point observation for this station/date. Try switching to yesterday or another station.'
-  }
-  if (/Failed to fetch|NetworkError/i.test(raw)) {
+  const { message, code, status } = upstreamErrorParts(e)
+  const haystack = `${code} ${message}`
+  if (/Failed to fetch|NetworkError/i.test(haystack)) {
     return 'Could not reach the radar proxy. Check your connection and try again.'
   }
-  return raw.replace(/^\[GET\]\s*"?[^"]*"?\s*/i, '').replace(/\s*<no response>\s*$/i, '').trim() || 'Could not load point timeseries.'
+  // Any proxy error whose message/code names the upstream (unavailable,
+  // timeout, parse error, ...) means BMKG itself is the problem.
+  if (/upstream/i.test(haystack)) {
+    return 'BMKG upstream data is currently unavailable for this station (or has no point observation for this date).'
+  }
+  if (status !== null && status >= 500) {
+    return 'The radar proxy could not load this point right now. Please try again shortly.'
+  }
+  return message || 'Could not load point timeseries.'
 }
 
 function formatTimeseriesTime(p: RadarTimeseriesPoint): string {
@@ -290,6 +358,7 @@ async function requestTimeseries(lngLat?: { lat: number, lng: number }) {
 
   if (!timeseriesStationId.value) {
     timeseriesError.value = 'Radar station list is still loading.'
+    timeseriesErrorDetail.value = ''
     timeseriesOpen.value = true
     return
   }
@@ -297,6 +366,7 @@ async function requestTimeseries(lngLat?: { lat: number, lng: number }) {
   timeseriesOpen.value = true
   timeseriesLoading.value = true
   timeseriesError.value = ''
+  timeseriesErrorDetail.value = ''
   timeseriesResult.value = null
 
   const date = getUtcDateCompact(timeseriesDateOption.value === 'yesterday' ? 1 : 0)
@@ -310,11 +380,12 @@ async function requestTimeseries(lngLat?: { lat: number, lng: number }) {
     const res = await $fetch<RadarEnvelope<RadarTimeseries>>(
       `${base}/api/timeseries/${timeseriesStationId.value}?${params}`,
     )
-    if (!res.ok) throw new Error(res.message ?? res.error ?? 'Could not load point timeseries.')
+    if (!res.ok) throw envelopeError(res, 'Could not load point timeseries.')
     timeseriesResult.value = res.data
   } catch (e) {
     console.warn('[radar] timeseries failed', e)
     timeseriesError.value = friendlyTimeseriesError(e)
+    timeseriesErrorDetail.value = formatUpstreamDetail(e)
   } finally {
     timeseriesLoading.value = false
   }
@@ -1594,7 +1665,7 @@ const tzAbbrev = computed(() => {
             type="button"
             aria-label="Close point timeseries"
             class="rounded-full p-1 text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
-            @click="timeseriesOpen = false"
+            @click="closeTimeseries"
           >
             <svg viewBox="0 0 16 16" class="size-4" fill="none" stroke="currentColor" stroke-width="1.75">
               <path d="M4 4l8 8M12 4l-8 8" stroke-linecap="round" />
@@ -1659,6 +1730,12 @@ const tzAbbrev = computed(() => {
         <div v-else-if="timeseriesError" class="my-4 rounded-xl border border-destructive/40 bg-destructive/5 p-3 text-xs leading-relaxed text-destructive">
           <p class="font-medium">Point observation unavailable</p>
           <p class="mt-1 text-[11px] text-muted-foreground">{{ timeseriesError }}</p>
+          <p
+            v-if="timeseriesErrorDetail"
+            class="mt-2 rounded bg-destructive/10 px-2 py-1 font-mono text-[10px] break-all text-destructive"
+          >
+            {{ timeseriesErrorDetail }}
+          </p>
           <div class="mt-2.5 flex items-center gap-2">
             <button
               v-if="timeseriesDateOption === 'today'"
