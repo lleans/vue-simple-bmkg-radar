@@ -45,9 +45,22 @@ const mapReady = ref(false)
 const vcutMode = ref(false)
 const vcutStart = ref<[number, number] | null>(null)
 const vcutEnd = ref<[number, number] | null>(null)
+// Manually chosen anchor radar for the cut line. `null` = auto-pick the
+// nearest station, mirroring the Rain Perception panel's Radar selector.
+const vcutStationId = ref<string | null>(null)
 const vcutLoading = ref(false)
 const vcutError = ref('')
 const vcutResult = ref<RadarVcut | null>(null)
+
+// Stations whose 250 km radar coverage intersects the VCUT line midpoint
+const vcutIntersectingStations = computed(() => {
+  if (!vcutStart.value || !vcutEnd.value) return []
+  const midpoint = { lat: (vcutStart.value[1] + vcutEnd.value[1]) / 2, lon: (vcutStart.value[0] + vcutEnd.value[0]) / 2 }
+  return stations.value
+    .map(s => ({ ...s, distKm: geoDistanceKm(midpoint.lon, midpoint.lat, s.lon, s.lat) }))
+    .filter(s => s.distKm <= STATION_RADIUS_KM)
+    .sort((a, b) => a.distKm - b.distKm)
+})
 const timeseriesOpen = ref(false)
 const timeseriesLoading = ref(false)
 const timeseriesError = ref('')
@@ -205,7 +218,10 @@ function closeVcutResult() {
 }
 
 async function requestVcut(start: [number, number], end: [number, number]) {
-  const station = vcutStationFor(start, end)
+  // A manually chosen anchor radar wins over the auto-pick nearest the line.
+  const station = vcutStationId.value
+    ? stations.value.find(s => s.id === vcutStationId.value) ?? null
+    : vcutStationFor(start, end)
   if (!station) { vcutError.value = 'Radar station list is not ready.'; vcutMode.value = false; return }
   const latestTime = productsByStation.value[station.id]?.latest?.time_utc
   const date = latestTime ? new Date(latestTime) : new Date(Date.now() - 5 * 60_000)
@@ -399,6 +415,15 @@ function setTimeseriesStation(id: string) {
   if (timeseriesStationId.value === id) return
   timeseriesStationId.value = id
   void requestTimeseries()
+}
+
+function setVcutStation(id: string) {
+  if (vcutStationId.value === id) return
+  vcutStationId.value = id
+  // If we have a line already drawn, re-request with the new anchor.
+  if (vcutStart.value && vcutEnd.value && !vcutMode.value) {
+    void requestVcut(vcutStart.value, vcutEnd.value)
+  }
 }
 
 function handleMapClick(e: maplibregl.MapMouseEvent) {
@@ -1630,6 +1655,32 @@ const tzAbbrev = computed(() => {
         <div class="overflow-hidden rounded-2xl border border-border/60 bg-card/95 shadow-2xl shadow-black/40 ring-1 ring-black/5 backdrop-blur-xl">
           <div class="flex items-center justify-between gap-3 border-b border-border/50 px-3 py-2.5 text-xs">
             <span class="truncate font-medium">Vertical cross-section · {{ vcutResult.station }} · {{ new Date(vcutResult.datetime_utc).toLocaleString() }}</span>
+            <div class="flex shrink-0 items-center gap-1.5">
+              <span class="text-[11px] text-muted-foreground">Radar:</span>
+              <!-- Station selector for the cut line, mirroring the Rain
+                   Perception panel's Radar dropdown. Auto-picks the nearest
+                   station, or lets the user override the anchor. -->
+              <select
+                :value="vcutStationId ?? vcutResult.station"
+                class="rounded-lg border border-border/60 bg-background/80 px-2 py-0.5 font-mono text-[11px] text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+                @change="setVcutStation(($event.target as HTMLSelectElement).value)"
+              >
+                <optgroup v-if="vcutIntersectingStations.length" label="In range (<= 250km)">
+                  <option v-for="s in vcutIntersectingStations" :key="s.id" :value="s.id">
+                    {{ s.id }} – {{ s.name }} ({{ Math.round(s.distKm) }} km)
+                  </option>
+                </optgroup>
+                <optgroup v-if="vcutIntersectingStations.length < stations.length" label="Other stations">
+                  <option
+                    v-for="s in stations.filter(st => !vcutIntersectingStations.some(i => i.id === st.id))"
+                    :key="s.id"
+                    :value="s.id"
+                  >
+                    {{ s.id }} – {{ s.name }}
+                  </option>
+                </optgroup>
+              </select>
+            </div>
             <button type="button" aria-label="Close vertical cross-section" class="shrink-0 rounded-full px-2 py-0.5 text-muted-foreground hover:bg-foreground/10" @click="closeVcutResult">×</button>
           </div>
           <div class="max-h-[55vh] overflow-y-auto bg-background/40 p-2 sm:p-3">
