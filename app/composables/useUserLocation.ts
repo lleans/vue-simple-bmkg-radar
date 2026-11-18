@@ -15,6 +15,35 @@ export interface UserLocation {
 
 const CACHE_KEY = 'radar:user-location:v1'
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000
+// Consent flag: we only look up the visitor's IP after they accept.
+const CONSENT_KEY = 'radar:geolocation-consent:v1'
+
+/** True if the user has already accepted (or rejected) geolocation lookup. */
+export function hasGeolocationConsent(): boolean {
+  try {
+    return localStorage.getItem(CONSENT_KEY) === 'true'
+  } catch {
+    return false
+  }
+}
+
+/** Ask the user whether geolocation lookup is OK. Returns true if accepted. */
+export function promptGeolocationConsent(): boolean {
+  // Already decided?
+  if (hasGeolocationConsent()) return true
+  // Browser confirms consent (geolocation API is a well-understood pattern).
+  const ok = window.confirm(
+    'Allow this app to look up your approximate location so the map shows your region? '
+    + 'Your IP address will be sent to a third-party geolocation service. '
+    + 'You can change this later in browser settings.',
+  )
+  try {
+    localStorage.setItem(CONSENT_KEY, String(ok))
+  } catch {
+    // storage unavailable — consent is session-scoped
+  }
+  return ok
+}
 
 // Rough box around the radar network (Indonesia plus a margin). Outside it a
 // regional view would contain no radar at all, so the country view is used.

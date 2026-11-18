@@ -349,21 +349,21 @@ const groupNames = computed(() => {
           <a
             href="https://www.bmkg.go.id/cuaca/radar/Indonesia"
             target="_blank"
-            rel="noreferrer"
+            rel="noreferrer noopener"
             class="font-medium text-foreground underline underline-offset-4 hover:text-foreground/80"
           >BMKG</a>
           and its SI-DARMA radar integration system. Basemap tiles are
           <a
             href="https://openfreemap.org/"
             target="_blank"
-            rel="noreferrer"
+            rel="noreferrer noopener"
             class="font-medium text-foreground underline underline-offset-4 hover:text-foreground/80"
           >OpenFreeMap</a>
           with data from
           <a
             href="https://www.openstreetmap.org/copyright"
             target="_blank"
-            rel="noreferrer"
+            rel="noreferrer noopener"
             class="font-medium text-foreground underline underline-offset-4 hover:text-foreground/80"
           >OpenStreetMap</a>
           contributors.

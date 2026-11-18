@@ -14,7 +14,10 @@ import { useRadarApi, type RadarFrame, type RadarStation, type RadarTimeseries, 
 import { useRadarArchive } from '~/composables/useRadarArchive'
 import { radarProductInfo } from '~/composables/radarProducts'
 import { useRadarTimeline } from '~/composables/useRadarTimeline'
-import { getCachedLocation, lookupUserLocation, inCoverage } from '~/composables/useUserLocation'
+import { getCachedLocation, lookupUserLocation, inCoverage, hasGeolocationConsent } from '~/composables/useUserLocation'
+import type { UserLocation } from '~/composables/useUserLocation'
+import ConsentBanner from '~/components/ConsentBanner.vue'
+import RadarStationPicker from '~/components/RadarStationPicker.vue'
 import { createBitmapScaler, useRadarCanvasOverlay, BITMAP_DEFAULT_EDGE, type RadarOverlayStation } from '~/composables/useRadarCanvasOverlay'
 import { HoverCardRoot, HoverCardContent, HoverCardPortal, HoverCardTrigger } from 'reka-ui'
 
@@ -1366,11 +1369,36 @@ onMounted(async () => {
     known ? LOCAL_ZOOM : DEFAULT_VIEW.zoom,
   )
 
-  // Stations and, on a first visit, the IP lookup run in parallel.
-  const [, located] = await Promise.all([
-    fetchStations(),
-    cached ? Promise.resolve(cached) : lookupUserLocation(),
-  ])
+  // Stations load in parallel. IP lookup waits for the user's consent via
+  // the banner. If the user skips (or 30s passes), the map stays on the
+  // country view.
+  let located: UserLocation | null = null
+  if (cached) {
+    located = cached
+  } else {
+    const consentResult = new Promise<UserLocation | null>((resolve) => {
+      let settled = false
+      const settle = (loc: UserLocation | null) => {
+        if (!settled) { settled = true; resolve(loc) }
+      }
+      // If consent was already given before this promise was created.
+      if (hasGeolocationConsent()) {
+        queueMicrotask(() => lookupUserLocation().then(settle))
+      } else {
+        const id = setInterval(() => {
+          if (hasGeolocationConsent()) { clearInterval(id); lookupUserLocation().then(settle) }
+        }, 200)
+        // Safety net: 30 s timeout resolves to null.
+        setTimeout(() => { clearInterval(id); settle(null) }, 30_000)
+      }
+    })
+    // Wait for stations + either consent lookup or timeout.
+    const [stationsDone, locResult] = await Promise.all([
+      fetchStations(),
+      consentResult,
+    ])
+    located = locResult
+  }
   // First visit: the map opened on the country view while we looked them up.
   // Move to their region now, unless they have already started panning.
   if (!cached && located && inCoverage(located) && !userMoved) {
@@ -1483,6 +1511,9 @@ const tzAbbrev = computed(() => {
 
 <template>
   <div class="relative h-full w-full overflow-hidden">
+    <!-- Geolocation consent banner (first-time visitors only) -->
+    <ConsentBanner />
+
     <!-- Map fills the card. The wrapper is positioned so MapLibre's
          own `.maplibregl-map { position: relative }` stylesheet (which
          is loaded after Tailwind) doesn't shrink the map to 0 height
@@ -1657,29 +1688,14 @@ const tzAbbrev = computed(() => {
             <span class="truncate font-medium">Vertical cross-section · {{ vcutResult.station }} · {{ new Date(vcutResult.datetime_utc).toLocaleString() }}</span>
             <div class="flex shrink-0 items-center gap-1.5">
               <span class="text-[11px] text-muted-foreground">Radar:</span>
-              <!-- Station selector for the cut line, mirroring the Rain
-                   Perception panel's Radar dropdown. Auto-picks the nearest
-                   station, or lets the user override the anchor. -->
-              <select
-                :value="vcutStationId ?? vcutResult.station"
-                class="rounded-lg border border-border/60 bg-background/80 px-2 py-0.5 font-mono text-[11px] text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
-                @change="setVcutStation(($event.target as HTMLSelectElement).value)"
-              >
-                <optgroup v-if="vcutIntersectingStations.length" label="In range (<= 250km)">
-                  <option v-for="s in vcutIntersectingStations" :key="s.id" :value="s.id">
-                    {{ s.id }} – {{ s.name }} ({{ Math.round(s.distKm) }} km)
-                  </option>
-                </optgroup>
-                <optgroup v-if="vcutIntersectingStations.length < stations.length" label="Other stations">
-                  <option
-                    v-for="s in stations.filter(st => !vcutIntersectingStations.some(i => i.id === st.id))"
-                    :key="s.id"
-                    :value="s.id"
-                  >
-                    {{ s.id }} – {{ s.name }}
-                  </option>
-                </optgroup>
-              </select>
+              <!-- Station selector for the cut line, using the project's
+                   shadcn-vue / reka-ui RadarStationPicker (same as the
+                   Rain Perception panel). null = auto-pick nearest. -->
+              <RadarStationPicker
+                :stations="stations"
+                :model-value="vcutStationId"
+                @update:model-value="(id: string | null) => setVcutStation(id ?? vcutResult.station)"
+              />
             </div>
             <button type="button" aria-label="Close vertical cross-section" class="shrink-0 rounded-full px-2 py-0.5 text-muted-foreground hover:bg-foreground/10" @click="closeVcutResult">×</button>
           </div>
@@ -1748,26 +1764,11 @@ const tzAbbrev = computed(() => {
 
           <div v-if="stations.length" class="flex items-center gap-1.5">
             <span class="text-[11px] text-muted-foreground">Radar:</span>
-            <select
-              :value="timeseriesStationId"
-              class="rounded-lg border border-border/60 bg-background/80 px-2 py-0.5 font-mono text-[11px] text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
-              @change="setTimeseriesStation(($event.target as HTMLSelectElement).value)"
-            >
-              <optgroup v-if="intersectingStations.length" label="In range (<= 250km)">
-                <option v-for="s in intersectingStations" :key="s.id" :value="s.id">
-                  {{ s.id }} – {{ s.name }} ({{ Math.round(s.distKm) }} km)
-                </option>
-              </optgroup>
-              <optgroup v-if="intersectingStations.length < stations.length" label="Other stations">
-                <option
-                  v-for="s in stations.filter(st => !intersectingStations.some(i => i.id === st.id))"
-                  :key="s.id"
-                  :value="s.id"
-                >
-                  {{ s.id }} – {{ s.name }}
-                </option>
-              </optgroup>
-            </select>
+            <RadarStationPicker
+              :stations="stations"
+              :model-value="timeseriesStationId"
+              @update:model-value="(id: string | null) => setTimeseriesStation(id ?? timeseriesStationId.value ?? '')"
+            />
           </div>
         </div>
 
