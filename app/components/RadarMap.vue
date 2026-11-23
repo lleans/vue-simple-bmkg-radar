@@ -14,9 +14,8 @@ import { useRadarApi, type RadarFrame, type RadarStation, type RadarTimeseries, 
 import { useRadarArchive } from '~/composables/useRadarArchive'
 import { radarProductInfo } from '~/composables/radarProducts'
 import { useRadarTimeline } from '~/composables/useRadarTimeline'
-import { getCachedLocation, lookupUserLocation, inCoverage, hasGeolocationConsent } from '~/composables/useUserLocation'
+import { getCachedLocation, lookupUserLocation, inCoverage } from '~/composables/useUserLocation'
 import type { UserLocation } from '~/composables/useUserLocation'
-import ConsentBanner from '~/components/ConsentBanner.vue'
 import RadarStationPicker from '~/components/RadarStationPicker.vue'
 import { createBitmapScaler, useRadarCanvasOverlay, BITMAP_DEFAULT_EDGE, type RadarOverlayStation } from '~/composables/useRadarCanvasOverlay'
 import { HoverCardRoot, HoverCardContent, HoverCardPortal, HoverCardTrigger } from 'reka-ui'
@@ -1361,49 +1360,24 @@ onMounted(async () => {
   window.addEventListener('resize', syncIsMobile, { passive: true })
   setupResizeObserver()
 
-  // A visitor we already know (cached lookup) gets their region immediately.
+  // Stations and visitor IP location run in parallel.
+  // Using visitor region directly avoids opening to the entire country,
+  // which would trigger all 50 radar stations at once and suffocate the worker API.
   const cached = getCachedLocation()
-  const known = cached && inCoverage(cached) ? cached : null
+  const locPromise = cached
+    ? Promise.resolve(cached)
+    : lookupUserLocation(2500)
+
+  const [, located] = await Promise.all([
+    fetchStations(),
+    locPromise,
+  ])
+
+  const known = located && inCoverage(located) ? located : null
   initMap(
     known ? [known.lon, known.lat] : DEFAULT_VIEW.center,
     known ? LOCAL_ZOOM : DEFAULT_VIEW.zoom,
   )
-
-  // Stations load in parallel. IP lookup waits for the user's consent via
-  // the banner. If the user skips (or 30s passes), the map stays on the
-  // country view.
-  let located: UserLocation | null = null
-  if (cached) {
-    located = cached
-  } else {
-    const consentResult = new Promise<UserLocation | null>((resolve) => {
-      let settled = false
-      const settle = (loc: UserLocation | null) => {
-        if (!settled) { settled = true; resolve(loc) }
-      }
-      // If consent was already given before this promise was created.
-      if (hasGeolocationConsent()) {
-        queueMicrotask(() => lookupUserLocation().then(settle))
-      } else {
-        const id = setInterval(() => {
-          if (hasGeolocationConsent()) { clearInterval(id); lookupUserLocation().then(settle) }
-        }, 200)
-        // Safety net: 30 s timeout resolves to null.
-        setTimeout(() => { clearInterval(id); settle(null) }, 30_000)
-      }
-    })
-    // Wait for stations + either consent lookup or timeout.
-    const [stationsDone, locResult] = await Promise.all([
-      fetchStations(),
-      consentResult,
-    ])
-    located = locResult
-  }
-  // First visit: the map opened on the country view while we looked them up.
-  // Move to their region now, unless they have already started panning.
-  if (!cached && located && inCoverage(located) && !userMoved) {
-    map?.jumpTo({ center: [located.lon, located.lat], zoom: LOCAL_ZOOM })
-  }
 
   // Nothing was fetched before this point, so the first load is only what is in view.
   viewReady = true
@@ -1511,9 +1485,6 @@ const tzAbbrev = computed(() => {
 
 <template>
   <div class="relative h-full w-full overflow-hidden">
-    <!-- Geolocation consent banner (first-time visitors only) -->
-    <ConsentBanner />
-
     <!-- Map fills the card. The wrapper is positioned so MapLibre's
          own `.maplibregl-map { position: relative }` stylesheet (which
          is loaded after Tailwind) doesn't shrink the map to 0 height

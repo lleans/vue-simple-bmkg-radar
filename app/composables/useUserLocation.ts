@@ -84,8 +84,7 @@ interface Provider {
   parse: (j: Record<string, unknown>) => UserLocation | null
 }
 
-// Tried in order. All are keyless and send CORS headers (checked from a
-// browser on localhost:3000).
+// Tried in order. All are keyless and send CORS headers.
 const PROVIDERS: Provider[] = [
   {
     name: 'ipwho.is',
@@ -93,14 +92,14 @@ const PROVIDERS: Provider[] = [
     parse: j => (j.success === false ? null : toLocation(j.latitude, j.longitude, j.city, j.country_code)),
   },
   {
-    name: 'ipapi.co',
-    url: 'https://ipapi.co/json/',
-    parse: j => (j.error ? null : toLocation(j.latitude, j.longitude, j.city, j.country_code)),
-  },
-  {
     name: 'geojs',
     url: 'https://get.geojs.io/v1/ip/geo.json',
     parse: j => toLocation(j.latitude, j.longitude, j.city, j.country_code),
+  },
+  {
+    name: 'ipapi.co',
+    url: 'https://ipapi.co/json/',
+    parse: j => (j.error ? null : toLocation(j.latitude, j.longitude, j.city, j.country_code)),
   },
 ]
 
