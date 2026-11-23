@@ -1614,26 +1614,34 @@ const tzAbbrev = computed(() => {
         <HoverCardContent side="top" :side-offset="8" align="start" :collision-padding="12" class="z-40 w-72 max-w-[calc(100vw-1.5rem)] rounded-2xl border border-border/60 bg-popover/95 p-3 text-popover-foreground shadow-2xl backdrop-blur-xl data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[side=bottom]:slide-in-from-top-2 data-[side=top]:slide-in-from-bottom-2">
           <p class="text-xs font-medium">VCUT — vertical cross-section</p>
           <p class="mt-1 text-[11px] leading-relaxed text-muted-foreground">Click this, then tap two points on the map. The radar makes a vertical slice between them (dBZ vs. height) for the latest frame.</p>
-          <p class="mt-2 text-xs font-medium">Rain Point & nowcast</p>
-          <p class="mt-1 text-[11px] leading-relaxed text-muted-foreground">Click "Rain Point" or <kbd class="rounded border border-border/60 bg-background/40 px-1 py-px font-mono text-[10px]">Alt</kbd> + click any spot on the map to view rain perception timeseries.</p>
         </HoverCardContent>
       </HoverCardRoot>
 
       <!-- Rain Point / Perception button -->
-      <button
-        type="button"
-        aria-label="Rain Perception: point radar timeseries"
-        :aria-pressed="pointMode || timeseriesOpen"
-        class="flex h-7 shrink-0 items-center gap-1 rounded-full border px-2 text-[10px] font-medium transition-colors sm:h-8 sm:gap-1.5 sm:px-2.5 sm:text-[11px]"
-        :class="(pointMode || timeseriesOpen) ? 'border-primary bg-primary text-primary-foreground shadow-sm' : 'border-border/60 text-foreground/75 hover:bg-foreground/10'"
-        @click="togglePointMode"
-      >
-        <svg viewBox="0 0 16 16" class="h-3.5 w-3.5 shrink-0" fill="none" stroke="currentColor" stroke-width="1.5">
-          <circle cx="8" cy="8" r="5" stroke-dasharray="2 2" />
-          <circle cx="8" cy="8" r="2" fill="currentColor" />
-        </svg>
-        <span>Rain Point</span>
-      </button>
+      <HoverCardRoot :open-delay="200" :close-delay="120">
+        <HoverCardTrigger as-child>
+          <button
+            type="button"
+            aria-label="Rain Perception: point radar timeseries"
+            :aria-pressed="pointMode || timeseriesOpen"
+            class="flex h-7 shrink-0 items-center gap-1 rounded-full border px-2 text-[10px] font-medium transition-colors sm:h-8 sm:gap-1.5 sm:px-2.5 sm:text-[11px]"
+            :class="(pointMode || timeseriesOpen) ? 'border-primary bg-primary text-primary-foreground shadow-sm' : 'border-border/60 text-foreground/75 hover:bg-foreground/10'"
+            @click="togglePointMode"
+          >
+            <svg viewBox="0 0 16 16" class="h-3.5 w-3.5 shrink-0" fill="none" stroke="currentColor" stroke-width="1.5">
+              <circle cx="8" cy="8" r="5" stroke-dasharray="2 2" />
+              <circle cx="8" cy="8" r="2" fill="currentColor" />
+            </svg>
+            <span>Rain Point</span>
+          </button>
+        </HoverCardTrigger>
+        <HoverCardContent side="top" :side-offset="8" align="start" :collision-padding="12" class="z-40 w-72 max-w-[calc(100vw-1.5rem)] rounded-2xl border border-border/60 bg-popover/95 p-3 text-popover-foreground shadow-2xl backdrop-blur-xl data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[side=bottom]:slide-in-from-top-2 data-[side=top]:slide-in-from-bottom-2">
+          <p class="text-xs font-medium">Rain Point — perception timeseries</p>
+          <p class="mt-1 text-[11px] leading-relaxed text-muted-foreground">Tap this, then tap a point on the map. You'll see how rainfall intensity at that spot changes over time.</p>
+          <p class="mt-2 text-xs font-medium">Tip</p>
+          <p class="mt-1 text-[11px] leading-relaxed text-muted-foreground">Or hold <kbd class="rounded border border-border/60 bg-background/40 px-1 py-px font-mono text-[10px]">Alt</kbd><span class="hidden sm:inline"> / </span><kbd class="rounded border border-border/60 bg-background/40 px-1 py-px font-mono text-[10px] sm:hidden">⌥</kbd><span class="hidden sm:inline">Option</span> + click anywhere on the map for a quick view.</p>
+        </HoverCardContent>
+      </HoverCardRoot>
 
       <RadarTimeRangeBar v-model:mode="mode" />
       <button class="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-foreground/90 text-background transition-transform hover:scale-105 sm:h-8 sm:w-8" :aria-label="playing ? 'Pause' : 'Play'" @click="playing ? pause() : play()">
@@ -1693,7 +1701,7 @@ const tzAbbrev = computed(() => {
                    Rain Perception panel). null = auto-pick nearest. -->
               <RadarStationPicker
                 :stations="stations"
-                :model-value="vcutStationId"
+                :model-value="vcutResult?.station ?? vcutStationId"
                 @update:model-value="(id: string | null) => setVcutStation(id ?? vcutResult.station)"
               />
             </div>
@@ -1892,22 +1900,15 @@ const tzAbbrev = computed(() => {
          the map panning through them. -->
     <div class="pointer-events-none absolute inset-0 z-[1]">
       <div
-        v-for="s in visibleStations"
+        v-for="s in viewMode === 'selected' && selectedStationId
+          ? visibleStations.filter(ss => ss.id === selectedStationId)
+          : visibleStations"
         :key="s.id"
         class="absolute will-change-transform"
         :style="{
           transform: `translate3d(${posOf(s.id).x}px, ${posOf(s.id).y}px, 0) translate(-50%, -50%)`,
-          width: `${
-            (viewMode === 'selected' && s.id !== selectedStationId
-              ? posOf(s.id).size * 0.55
-              : posOf(s.id).size) || frameSize
-          }px`,
-          height: `${
-            (viewMode === 'selected' && s.id !== selectedStationId
-              ? posOf(s.id).size * 0.55
-              : posOf(s.id).size) || frameSize
-          }px`,
-          opacity: viewMode === 'selected' && s.id !== selectedStationId ? 0.35 : 1,
+          width: `${posOf(s.id).size || frameSize}px`,
+          height: `${posOf(s.id).size || frameSize}px`,
         }"
       >
         <div class="relative h-full w-full">
