@@ -3,7 +3,7 @@
   # See audit findings F2 (CSP) and F3 (X-Frame-Options)
 
   # Content-Security-Policy — lock down what the browser can load and execute
-  Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; worker-src 'self' blob:; child-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' https://pub-690fce0c301c483cbbf46234d40798f2.r2.dev https://tiles.openfreemap.org data: blob:; font-src 'self' https://cdn.jsdelivr.net data:; connect-src 'self' https://darma-proxy.lleans.dev https://get.geojs.io https://ipwho.is https://ipapi.co https://tiles.openfreemap.org blob:; frame-ancestors 'none'; base-uri 'self'; form-action 'none'; object-src 'none';
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; worker-src 'self' blob:; child-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' https://*.lleans.dev https://*.r2.dev https://tiles.openfreemap.org data: blob:; font-src 'self' https://cdn.jsdelivr.net data:; connect-src 'self' https://*.lleans.dev https://*.r2.dev https://get.geojs.io https://ipwho.is https://ipapi.co https://tiles.openfreemap.org blob:; frame-ancestors 'none'; base-uri 'self'; form-action 'none'; object-src 'none';
 
   # Prevent clickjacking
   X-Frame-Options: DENY
