@@ -1,0 +1,21 @@
+/*
+  # Security headers for static deploy (Cloudflare Pages)
+  # See audit findings F2 (CSP) and F3 (X-Frame-Options)
+
+  # Content-Security-Policy — lock down what the browser can load and execute
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https://pub-690fce0c301c483cbbf46234d40798f2.r2.dev https://tiles.openfreemap.org data:; font-src 'self' https://cdn.jsdelivr.net; connect-src 'self' https://darma-proxy.lleans.dev https://get.geojs.io https://ipwho.is https://ipapi.co; frame-ancestors 'none'; base-uri 'self'; form-action 'none'; object-src 'none';
+
+  # Prevent clickjacking
+  X-Frame-Options: DENY
+
+  # Prevent MIME-sniffing
+  X-Content-Type-Options: nosniff
+
+  # XSS filter
+  X-XSS-Protection: 1; mode=block
+
+  # Referrer policy
+  Referrer-Policy: strict-origin-when-cross-origin
+
+  # Permissions policy — restrict camera/microphone/location
+  Permissions-Policy: camera=(), microphone=(), geolocation=()
