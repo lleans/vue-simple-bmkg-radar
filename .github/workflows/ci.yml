@@ -24,6 +24,10 @@ jobs:
           node-version: 22
           cache: "npm"
 
+      - name: Sync lockfile (Dependabot PRs)
+        if: github.actor == 'dependabot[bot]'
+        run: npm install --package-lock-only --ignore-scripts
+
       - name: Install dependencies
         run: npm ci
 
