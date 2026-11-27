@@ -19,7 +19,7 @@ export type RangeOption = '1h' | '6h' | '24h'
 const RANGE_HOURS: Record<RangeOption, number> = { '1h': 1, '6h': 6, '24h': 24 }
 
 export const useRadarArchive = () => {
-  const { base, product: productRef, stations } = useRadarApi()
+  const { base, product: productRef, resolution, stations } = useRadarApi()
 
   const stationId = useState<string | null>('radar:archive:station', () => null)
   const range = useState<RangeOption>('radar:archive:range', () => '1h')
@@ -104,7 +104,7 @@ export const useRadarArchive = () => {
     loading.value = true
     error.value = null
     try {
-      const params = new URLSearchParams({ product: code, start: startCompact, end: endCompact })
+      const params = new URLSearchParams({ product: code, start: startCompact, end: endCompact, resolution: resolution.value })
       const res = await withRetry(
         () => $fetch<ArchiveEnvelope>(`${base}/api/archive/${station}?${params}`, { signal: ac.signal }),
         { signal: ac.signal },

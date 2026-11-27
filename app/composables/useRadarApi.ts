@@ -15,6 +15,7 @@ export interface RadarStation {
 
 export interface RadarFrame {
   url: string
+  url_original?: string
   time_utc: string
   forecast_offset_minutes: number | null
 }
@@ -51,6 +52,16 @@ export interface RadarVcut {
   datetime_utc: string
   product: string
   image_url: string
+  image_url_original?: string
+}
+
+export type ImageResolution = 'full' | 'high' | 'medium' | 'low'
+
+export function zoomToResolution(zoom: number): ImageResolution {
+  if (zoom >= 8) return 'full'
+  if (zoom >= 7) return 'high'
+  if (zoom >= 6) return 'medium'
+  return 'low'
 }
 
 interface Envelope<T> {
@@ -90,6 +101,7 @@ export const useRadarApi = () => {
   const stationsError = useState<string | null>('radar:stationsError', () => null)
   const stationsLoading = useState<boolean>('radar:stationsLoading', () => false)
   const product = useState<RadarProductCode>('radar:product', () => 'CMAX')
+  const resolution = useState<ImageResolution>('radar:resolution', () => 'full')
   // productLoading: how many station products are still in flight
   const productsLoading = useState<number>('radar:productsLoading', () => 0)
   // Stations currently waiting on a nowcast response (excludes cache hits).
@@ -132,7 +144,7 @@ export const useRadarApi = () => {
         // Transient failures (no CORS header from a mid-deploy instance) are
         // retried; a real API answer is returned as-is.
         const res = await withRetry(() =>
-          $fetch<Envelope<RadarProduct>>(`${base}/api/nowcast/${stationId}?product=${code}`),
+          $fetch<Envelope<RadarProduct>>(`${base}/api/nowcast/${stationId}?product=${code}&resolution=${resolution.value}`),
         )
         // The product may have been switched while in flight: drop the
         // stale answer instead of mixing products on the map.
@@ -200,6 +212,7 @@ export const useRadarApi = () => {
     base,
     product,
     setProduct,
+    resolution,
     stations,
     stationsError,
     stationsLoading,
