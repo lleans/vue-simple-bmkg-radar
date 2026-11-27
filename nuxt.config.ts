@@ -66,6 +66,11 @@ export default defineNuxtConfig({
     prefix: '',
     componentDir: '@/components/ui'
   },
+  icon: {
+    provider: 'server',
+    serverBundle: 'local',
+    fallbackToApi: false,
+  },
   modules: [
     '@nuxt/eslint',
     '@nuxt/hints',
