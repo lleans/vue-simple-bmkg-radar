@@ -11,6 +11,7 @@ import type { Map as MaplibreMap, StyleSpecification } from 'maplibre-gl'
 // and setWorkerUrl points MapLibre at the emitted copy.
 import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?url'
 import { useRadarApi, zoomToResolution, type RadarFrame, type RadarStation, type RadarTimeseries, type RadarVcut } from '~/composables/useRadarApi'
+import { useLightning, type LightningStrike } from '~/composables/useLightning'
 import { useRadarArchive } from '~/composables/useRadarArchive'
 import { radarProductInfo } from '~/composables/radarProducts'
 import { useRadarTimeline } from '~/composables/useRadarTimeline'
@@ -39,6 +40,87 @@ const {
   resolution,
   base,
 } = useRadarApi()
+
+// --- Lightning layer -------------------------------------------------------
+const { strikes: lightningStrikes, enabled: lightningEnabled, startAutoRefresh: startLightningRefresh, stopAutoRefresh: stopLightningRefresh } = useLightning()
+const LIGHTNING_SOURCE = 'lightning-strikes'
+let lightningPopup: maplibregl.Popup | null = null
+
+function lightningGeoJson(list: LightningStrike[]): maplibregl.GeoJSONSourceSpecification['data'] {
+  return {
+    type: 'FeatureCollection',
+    features: lightningEnabled.value
+      ? list.map((s) => ({
+          type: 'Feature' as const,
+          geometry: { type: 'Point' as const, coordinates: [s.lon, s.lat] },
+          properties: { time_utc: s.time_utc, current_ka: s.current_ka, polarity: s.polarity, strike_type: s.strike_type },
+        }))
+      : [],
+  }
+}
+
+function syncLightningSource() {
+  const src = map?.getSource(LIGHTNING_SOURCE) as maplibregl.GeoJSONSource | undefined
+  src?.setData(lightningGeoJson(lightningStrikes.value))
+}
+
+// setStyle (basemap theme swaps) drops custom sources/layers, so this is
+// idempotent and re-run on every `style.load`.
+function ensureLightningLayers() {
+  if (!map || map.getSource(LIGHTNING_SOURCE)) return
+  map.addSource(LIGHTNING_SOURCE, { type: 'geojson', data: lightningGeoJson(lightningStrikes.value) })
+  // CG strikes bright yellow, IC (in-cloud) a paler tone. Radius grows mildly with |kA|.
+  const color: maplibregl.ExpressionSpecification = ['match', ['get', 'strike_type'], 'CG', '#FFD700', '#FFF3A3']
+  const kaScale = (min: number, max: number): maplibregl.ExpressionSpecification => [
+    'interpolate', ['linear'], ['abs', ['to-number', ['get', 'current_ka'], 0]],
+    0, min, 50, max,
+  ]
+  map.addLayer({
+    id: 'lightning-strikes-glow',
+    type: 'circle',
+    source: LIGHTNING_SOURCE,
+    paint: { 'circle-color': color, 'circle-radius': kaScale(7, 12), 'circle-opacity': 0.18, 'circle-blur': 0.8 },
+  })
+  map.addLayer({
+    id: 'lightning-strikes-point',
+    type: 'circle',
+    source: LIGHTNING_SOURCE,
+    paint: {
+      'circle-color': color,
+      'circle-radius': kaScale(2.5, 5),
+      'circle-opacity': 0.9,
+      'circle-stroke-width': 0.75,
+      'circle-stroke-color': 'rgba(0,0,0,0.45)',
+    },
+  })
+}
+
+function escapeHtml(v: string) {
+  return v.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!))
+}
+
+function handleLightningClick(e: maplibregl.MapMouseEvent & { features?: maplibregl.MapGeoJSONFeature[] }) {
+  const f = e.features?.[0]
+  if (!f || f.geometry.type !== 'Point' || !map) return
+  const p = f.properties as { time_utc: string; current_ka: number; polarity: string; strike_type: string }
+  const time = new Date(p.time_utc).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+  const type = p.strike_type === 'CG' ? 'Cloud-to-ground' : p.strike_type === 'IC' ? 'In-cloud' : p.strike_type
+  lightningPopup?.remove()
+  lightningPopup = new maplibregl.Popup({ closeButton: false, offset: 10, maxWidth: '200px' })
+    .setLngLat(f.geometry.coordinates as [number, number])
+    .setHTML(
+      `<div style="font-size:12px;line-height:1.5;color:#111">`
+      + `<strong>⚡ Lightning strike</strong><br>${escapeHtml(time)}<br>`
+      + `${Number(p.current_ka).toFixed(1)} kA · ${escapeHtml(p.polarity)} polarity<br>${escapeHtml(type)}</div>`,
+    )
+    .addTo(map)
+}
+
+watch(lightningStrikes, syncLightningSource)
+watch(lightningEnabled, (on) => {
+  syncLightningSource()
+  if (!on) lightningPopup?.remove()
+})
 const archive = useRadarArchive()
 const mode = ref<'live' | 'archive'>('live')
 
@@ -1404,7 +1486,13 @@ function initMap(center: [number, number], zoom: number) {
   map.addControl(new maplibregl.AttributionControl({ compact: true }), 'bottom-right')
   // No +/- buttons: the wheel zooms, pinch works, and the UI is cleaner.
   // Keep double-click zoom, which is the remaining pointer affordance.
+  map.on('style.load', ensureLightningLayers)
+  map.on('click', 'lightning-strikes-point', handleLightningClick)
+  map.on('mouseenter', 'lightning-strikes-point', () => map?.getCanvas().style.setProperty('cursor', 'pointer'))
+  map.on('mouseleave', 'lightning-strikes-point', () => map?.getCanvas().style.setProperty('cursor', ''))
   map.on('load', () => {
+    ensureLightningLayers()
+    if (lightningEnabled.value) startLightningRefresh()
     mapReady.value = true
     applyBasemapTheme()
     // Force a resize in case the container was 0-height at construction
@@ -1471,6 +1559,8 @@ onUnmounted(() => {
   if (visibleTimer) clearTimeout(visibleTimer)
   resizeObserver?.disconnect()
   resizeObserver = null
+  stopLightningRefresh()
+  lightningPopup?.remove()
   map?.remove()
   map = null
   imageCache.clear()
@@ -1694,6 +1784,20 @@ const tzAbbrev = computed(() => {
           <p class="mt-1 text-[11px] leading-relaxed text-muted-foreground">Or hold <kbd class="rounded border border-border/60 bg-background/40 px-1 py-px font-mono text-[10px]">Alt</kbd><span class="hidden sm:inline"> / </span><kbd class="rounded border border-border/60 bg-background/40 px-1 py-px font-mono text-[10px] sm:hidden">⌥</kbd><span class="hidden sm:inline">Option</span> + click anywhere on the map for a quick view.</p>
         </HoverCardContent>
       </HoverCardRoot>
+
+      <!-- Lightning toggle -->
+      <button
+        type="button"
+        aria-label="Toggle lightning strikes"
+        :aria-pressed="lightningEnabled"
+        class="flex h-7 shrink-0 items-center gap-1 rounded-full border px-2 text-[10px] font-medium transition-colors sm:h-8 sm:gap-1.5 sm:px-2.5 sm:text-[11px]"
+        :class="lightningEnabled ? 'border-primary bg-primary text-primary-foreground shadow-sm' : 'border-border/60 text-foreground/75 hover:bg-foreground/10'"
+        @click="lightningEnabled = !lightningEnabled"
+      >
+        <svg viewBox="0 0 16 16" class="h-3.5 w-3.5 shrink-0" fill="currentColor" aria-hidden="true"><path d="M9.5 1 3 9h4l-1 6 7-9H9l.5-5z" /></svg>
+        <span>Lightning</span>
+        <span v-if="lightningEnabled && lightningStrikes.length > 0" class="rounded-full bg-background/25 px-1.5 text-[9px] tabular-nums">{{ lightningStrikes.length }}</span>
+      </button>
 
       <RadarTimeRangeBar v-model:mode="mode" />
       <button class="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-foreground/90 text-background transition-transform hover:scale-105 sm:h-8 sm:w-8" :aria-label="playing ? 'Pause' : 'Play'" @click="playing ? pause() : play()">
