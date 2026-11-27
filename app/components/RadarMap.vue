@@ -44,7 +44,11 @@ const {
 // --- Lightning layer -------------------------------------------------------
 const { strikes: lightningStrikes, enabled: lightningEnabled, startAutoRefresh: startLightningRefresh, stopAutoRefresh: stopLightningRefresh } = useLightning()
 const LIGHTNING_SOURCE = 'lightning-strikes'
-let lightningPopup: maplibregl.Popup | null = null
+// The strike whose details are shown on hover. Rendered as a design-system card
+// (Teleported out of the map's overflow-hidden container so it never clips),
+// not a raw MapLibre HTML popup.
+interface SelectedStrike { time: string; currentKa: number; polarity: string; type: string; lng: number; lat: number }
+const hoveredStrike = ref<SelectedStrike | null>(null)
 
 function lightningGeoJson(list: LightningStrike[]): maplibregl.GeoJSONSourceSpecification['data'] {
   return {
@@ -95,31 +99,29 @@ function ensureLightningLayers() {
   })
 }
 
-function escapeHtml(v: string) {
-  return v.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!))
-}
-
-function handleLightningClick(e: maplibregl.MapMouseEvent & { features?: maplibregl.MapGeoJSONFeature[] }) {
+function handleLightningHover(e: maplibregl.MapMouseEvent & { features?: maplibregl.MapGeoJSONFeature[] }) {
   const f = e.features?.[0]
   if (!f || f.geometry.type !== 'Point' || !map) return
   const p = f.properties as { time_utc: string; current_ka: number; polarity: string; strike_type: string }
-  const time = new Date(p.time_utc).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-  const type = p.strike_type === 'CG' ? 'Cloud-to-ground' : p.strike_type === 'IC' ? 'In-cloud' : p.strike_type
-  lightningPopup?.remove()
-  lightningPopup = new maplibregl.Popup({ closeButton: false, offset: 10, maxWidth: '200px' })
-    .setLngLat(f.geometry.coordinates as [number, number])
-    .setHTML(
-      `<div style="font-size:12px;line-height:1.5;color:#111">`
-      + `<strong>⚡ Lightning strike</strong><br>${escapeHtml(time)}<br>`
-      + `${Number(p.current_ka).toFixed(1)} kA · ${escapeHtml(p.polarity)} polarity<br>${escapeHtml(type)}</div>`,
-    )
-    .addTo(map)
+  const [lng, lat] = f.geometry.coordinates as [number, number]
+  hoveredStrike.value = {
+    time: new Date(p.time_utc).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+    currentKa: Number(p.current_ka),
+    polarity: p.polarity,
+    type: p.strike_type === 'CG' ? 'Cloud-to-ground' : p.strike_type === 'IC' ? 'In-cloud' : p.strike_type,
+    lng,
+    lat,
+  }
+}
+
+function handleLightningLeave() {
+  hoveredStrike.value = null
 }
 
 watch(lightningStrikes, syncLightningSource)
 watch(lightningEnabled, (on) => {
   syncLightningSource()
-  if (!on) lightningPopup?.remove()
+  if (!on) hoveredStrike.value = null
 })
 const archive = useRadarArchive()
 const mode = ref<'live' | 'archive'>('live')
@@ -189,6 +191,7 @@ const isSafari = ref(false)
 function startPointMode() {
   pointMode.value = true
   vcutMode.value = false
+  hoveredStrike.value = null
   if (map) map.getCanvas().style.cursor = 'crosshair'
 }
 
@@ -244,6 +247,18 @@ const timeseriesScreen = computed(() => {
   void overlayPos.value
   const p = map.project([timeseriesCoords.value.lon, timeseriesCoords.value.lat])
   return { x: p.x, y: p.y }
+})
+
+// Viewport (not container-relative) position of the selected lightning strike,
+// so the Teleported info card can be `fixed`-positioned outside the map's
+// overflow-hidden container. Recomputes on every map move via overlayPos.
+const lightningScreen = computed(() => {
+  void overlayPos.value
+  if (!map || !lightningEnabled.value || !hoveredStrike.value) return null
+  const rect = mapContainer.value?.getBoundingClientRect()
+  if (!rect) return null
+  const p = map.project([hoveredStrike.value.lng, hoveredStrike.value.lat])
+  return { x: rect.left + p.x, y: rect.top + p.y }
 })
 
 // Stations whose 250km radar coverage intersects the sampled point
@@ -304,6 +319,7 @@ function startVcut() {
   // VCUT and Rain Point are mutually exclusive: entering one leaves the other.
   // (startPointMode already clears vcutMode; mirror it here.)
   pointMode.value = false
+  hoveredStrike.value = null
   vcutStart.value = null
   vcutEnd.value = null
   vcutError.value = ''
@@ -1487,9 +1503,15 @@ function initMap(center: [number, number], zoom: number) {
   // No +/- buttons: the wheel zooms, pinch works, and the UI is cleaner.
   // Keep double-click zoom, which is the remaining pointer affordance.
   map.on('style.load', ensureLightningLayers)
-  map.on('click', 'lightning-strikes-point', handleLightningClick)
-  map.on('mouseenter', 'lightning-strikes-point', () => map?.getCanvas().style.setProperty('cursor', 'pointer'))
-  map.on('mouseleave', 'lightning-strikes-point', () => map?.getCanvas().style.setProperty('cursor', ''))
+  map.on('mouseenter', 'lightning-strikes-point', (e) => {
+    map?.getCanvas().style.setProperty('cursor', 'pointer')
+    handleLightningHover(e)
+  })
+  map.on('mousemove', 'lightning-strikes-point', handleLightningHover)
+  map.on('mouseleave', 'lightning-strikes-point', () => {
+    map?.getCanvas().style.setProperty('cursor', '')
+    handleLightningLeave()
+  })
   map.on('load', () => {
     ensureLightningLayers()
     if (lightningEnabled.value) startLightningRefresh()
@@ -1560,7 +1582,6 @@ onUnmounted(() => {
   resizeObserver?.disconnect()
   resizeObserver = null
   stopLightningRefresh()
-  lightningPopup?.remove()
   map?.remove()
   map = null
   imageCache.clear()
@@ -1695,6 +1716,32 @@ const tzAbbrev = computed(() => {
         </span>
       </div>
     </div>
+
+    <!-- Lightning strike details: a design-system tooltip Teleported to <body> so
+         it is never clipped by the map's overflow-hidden container, positioned
+         at the strike (tracks pan via lightningScreen). Appears on hover. -->
+    <Teleport to="body">
+      <Transition name="pill">
+        <div
+          v-if="hoveredStrike && lightningScreen"
+          class="pointer-events-none fixed z-[60] w-max max-w-64 -translate-x-1/2 -translate-y-full select-none"
+          :style="{ left: `${lightningScreen.x}px`, top: `${lightningScreen.y - 10}px` }"
+          role="tooltip"
+          aria-label="Lightning strike details"
+        >
+          <div class="rounded-xl border border-border/60 bg-popover px-3 py-2 text-popover-foreground shadow-xl">
+            <div class="flex items-center gap-1.5 text-xs font-semibold tracking-tight">
+              <span aria-hidden="true">⚡</span><span>Lightning strike</span>
+            </div>
+            <div class="mt-1 space-y-0.5 text-[11px] leading-relaxed text-muted-foreground">
+              <div>{{ hoveredStrike.time }}</div>
+              <div>{{ hoveredStrike.currentKa.toFixed(1) }} kA · {{ hoveredStrike.polarity }} polarity</div>
+              <div>{{ hoveredStrike.type }}</div>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
 
     <Transition name="pill">
       <div

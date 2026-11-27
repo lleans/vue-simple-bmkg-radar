@@ -22,7 +22,7 @@ const bands = computed(() => bandsFor(info.value.scale))
 </script>
 
 <template>
-  <div class="rounded-2xl border border-border/60 bg-card/80 px-3 py-2 backdrop-blur-xl">
+  <div class="rounded-2xl border border-border/60 bg-card/95 px-3 py-2 sm:bg-card/80 sm:backdrop-blur-xl">
     <div v-if="showTitle" class="mb-1.5 flex items-center justify-between gap-2 text-[11px]">
       <span class="font-mono font-medium text-foreground">{{ info.code }}</span>
       <span class="text-muted-foreground">{{ info.unit }}</span>

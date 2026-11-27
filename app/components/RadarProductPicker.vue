@@ -51,7 +51,7 @@ function onSelect(code: unknown) {
       <button
         type="button"
         aria-label="Radar product"
-        class="flex h-8 items-center gap-2 rounded-full border border-border/60 bg-card/80 px-3 text-xs font-medium shadow-lg backdrop-blur-xl transition-colors hover:bg-card"
+        class="flex h-8 items-center gap-2 rounded-full border border-border/60 bg-card/95 px-3 text-xs font-medium shadow-lg transition-colors hover:bg-card sm:bg-card/80 sm:backdrop-blur-xl"
       >
         <Layers class="size-3.5 shrink-0 text-foreground/60" />
         <span class="font-mono">{{ current.code }}</span>

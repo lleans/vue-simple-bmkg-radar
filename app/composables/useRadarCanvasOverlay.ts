@@ -76,10 +76,13 @@ export const useRadarCanvasOverlay = (
     if (!el || !ctx) return
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
     ctx.clearRect(0, 0, el.width, el.height)
-    // Set screen blend mode once for the entire batch. In Safari / WebKit,
-    // switching composite operations or clipping per station inside the loop
-    // forces offscreen GPU render pass breaks and CPU synchronization.
-    ctx.globalCompositeOperation = 'screen'
+    // 'lighten' takes max per channel per pixel where two stations overlap:
+    // whichever station read the higher reflectivity at this point wins, which
+    // matches CMAX semantics and avoids the additive brightening/wash-out that
+    // 'screen' gave in overlap regions. Set once for the whole batch — in
+    // Safari / WebKit, switching composite operations or clipping per station
+    // inside the loop forces offscreen GPU render-pass breaks.
+    ctx.globalCompositeOperation = 'lighten'
 
     for (const s of getStations()) {
       const url = resolveFrame(s.id)
