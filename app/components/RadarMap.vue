@@ -43,86 +43,98 @@ const {
 
 // --- Lightning layer -------------------------------------------------------
 const { strikes: lightningStrikes, enabled: lightningEnabled, startAutoRefresh: startLightningRefresh, stopAutoRefresh: stopLightningRefresh } = useLightning()
-const LIGHTNING_SOURCE = 'lightning-strikes'
+// Strikes are drawn on their own canvas stacked ABOVE the radar frames. They
+// used to be MapLibre layers, but the radar frames are a separate canvas over
+// the map, so map-layer strikes always ended up underneath them.
+const lightningCanvas = ref<HTMLCanvasElement | null>(null)
+// Hover tolerance in CSS px around a strike's centre.
+const LIGHTNING_HIT_PX = 8
 // The strike whose details are shown on hover. Rendered as a design-system card
-// (Teleported out of the map's overflow-hidden container so it never clips),
-// not a raw MapLibre HTML popup.
+// (Teleported out of the map's overflow-hidden container so it never clips).
 interface SelectedStrike { time: string; currentKa: number; polarity: string; type: string; lng: number; lat: number }
 const hoveredStrike = ref<SelectedStrike | null>(null)
 
-function lightningGeoJson(list: LightningStrike[]): maplibregl.GeoJSONSourceSpecification['data'] {
+function toSelectedStrike(s: LightningStrike): SelectedStrike {
   return {
-    type: 'FeatureCollection',
-    features: lightningEnabled.value
-      ? list.map((s) => ({
-          type: 'Feature' as const,
-          geometry: { type: 'Point' as const, coordinates: [s.lon, s.lat] },
-          properties: { time_utc: s.time_utc, current_ka: s.current_ka, polarity: s.polarity, strike_type: s.strike_type },
-        }))
-      : [],
+    time: new Date(s.time_utc).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+    currentKa: Number(s.current_ka),
+    polarity: s.polarity,
+    type: s.strike_type === 'CG' ? 'Cloud-to-ground' : s.strike_type === 'IC' ? 'In-cloud' : s.strike_type,
+    lng: s.lon,
+    lat: s.lat,
   }
 }
 
-function syncLightningSource() {
-  const src = map?.getSource(LIGHTNING_SOURCE) as maplibregl.GeoJSONSource | undefined
-  src?.setData(lightningGeoJson(lightningStrikes.value))
-}
-
-// setStyle (basemap theme swaps) drops custom sources/layers, so this is
-// idempotent and re-run on every `style.load`.
-function ensureLightningLayers() {
-  if (!map || map.getSource(LIGHTNING_SOURCE)) return
-  map.addSource(LIGHTNING_SOURCE, { type: 'geojson', data: lightningGeoJson(lightningStrikes.value) })
-  // CG strikes bright yellow, IC (in-cloud) a paler tone. Radius grows mildly with |kA|.
-  const color: maplibregl.ExpressionSpecification = ['match', ['get', 'strike_type'], 'CG', '#FFD700', '#FFF3A3']
-  const kaScale = (min: number, max: number): maplibregl.ExpressionSpecification => [
-    'interpolate', ['linear'], ['abs', ['to-number', ['get', 'current_ka'], 0]],
-    0, min, 50, max,
-  ]
-  map.addLayer({
-    id: 'lightning-strikes-glow',
-    type: 'circle',
-    source: LIGHTNING_SOURCE,
-    paint: { 'circle-color': color, 'circle-radius': kaScale(7, 12), 'circle-opacity': 0.18, 'circle-blur': 0.8 },
-  })
-  map.addLayer({
-    id: 'lightning-strikes-point',
-    type: 'circle',
-    source: LIGHTNING_SOURCE,
-    paint: {
-      'circle-color': color,
-      'circle-radius': kaScale(2.5, 5),
-      'circle-opacity': 0.9,
-      'circle-stroke-width': 0.75,
-      'circle-stroke-color': 'rgba(0,0,0,0.45)',
-    },
-  })
-}
-
-function handleLightningHover(e: maplibregl.MapMouseEvent & { features?: maplibregl.MapGeoJSONFeature[] }) {
-  const f = e.features?.[0]
-  if (!f || f.geometry.type !== 'Point' || !map) return
-  const p = f.properties as { time_utc: string; current_ka: number; polarity: string; strike_type: string }
-  const [lng, lat] = f.geometry.coordinates as [number, number]
-  hoveredStrike.value = {
-    time: new Date(p.time_utc).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-    currentKa: Number(p.current_ka),
-    polarity: p.polarity,
-    type: p.strike_type === 'CG' ? 'Cloud-to-ground' : p.strike_type === 'IC' ? 'In-cloud' : p.strike_type,
-    lng,
-    lat,
+// Repaint the strike canvas for the current projection. Called on every map
+// move (via refreshProjections), on data/enable changes and on resize.
+function drawLightning() {
+  const el = lightningCanvas.value
+  if (!el || !map) return
+  const ctx = el.getContext('2d')
+  if (!ctx) return
+  const css = map.getCanvas()
+  const w = css.clientWidth
+  const h = css.clientHeight
+  const dpr = window.devicePixelRatio || 1
+  if (el.width !== Math.round(w * dpr) || el.height !== Math.round(h * dpr)) {
+    el.width = Math.round(w * dpr)
+    el.height = Math.round(h * dpr)
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+  ctx.clearRect(0, 0, w, h)
+  if (!lightningEnabled.value) return
+  for (const s of lightningStrikes.value) {
+    const p = map.project([s.lon, s.lat])
+    if (p.x < -20 || p.y < -20 || p.x > w + 20 || p.y > h + 20) continue
+    // CG strikes bright yellow, IC (in-cloud) a paler tone. Radius grows with |kA|.
+    const k = Math.min(50, Math.abs(Number(s.current_ka) || 0)) / 50
+    const color = s.strike_type === 'CG' ? '#FFD700' : '#FFF3A3'
+    ctx.globalAlpha = 0.18
+    ctx.fillStyle = color
+    ctx.beginPath()
+    ctx.arc(p.x, p.y, 7 + 5 * k, 0, Math.PI * 2)
+    ctx.fill()
+    ctx.globalAlpha = 0.9
+    ctx.beginPath()
+    ctx.arc(p.x, p.y, 2.5 + 2.5 * k, 0, Math.PI * 2)
+    ctx.fill()
+    ctx.globalAlpha = 1
+    ctx.lineWidth = 0.75
+    ctx.strokeStyle = 'rgba(0,0,0,0.45)'
+    ctx.stroke()
   }
 }
 
-function handleLightningLeave() {
-  hoveredStrike.value = null
+// Nearest visible strike within the hit radius of a CSS-px point, or null.
+function nearestLightningStrike(pt: { x: number, y: number }): LightningStrike | null {
+  if (!map || !lightningEnabled.value) return null
+  let best: LightningStrike | null = null
+  let bestD = LIGHTNING_HIT_PX * LIGHTNING_HIT_PX
+  for (const s of lightningStrikes.value) {
+    const p = map.project([s.lon, s.lat])
+    const d = (p.x - pt.x) ** 2 + (p.y - pt.y) ** 2
+    if (d <= bestD) { bestD = d; best = s }
+  }
+  return best
 }
 
-watch(lightningStrikes, syncLightningSource)
-watch(lightningEnabled, (on) => {
-  syncLightningSource()
-  if (!on) hoveredStrike.value = null
-})
+function updateLightningHover(pt: { x: number, y: number }) {
+  if (!map) return
+  const pickingTool = vcutMode.value || pointMode.value
+  const hit = pickingTool ? null : nearestLightningStrike(pt)
+  if (!hit) {
+    if (hoveredStrike.value) hoveredStrike.value = null
+    return
+  }
+  const next = toSelectedStrike(hit)
+  const cur = hoveredStrike.value
+  if (!cur || cur.lng !== next.lng || cur.lat !== next.lat || cur.time !== next.time) hoveredStrike.value = next
+}
+
+watch([lightningStrikes, lightningEnabled], () => {
+  drawLightning()
+  if (!lightningEnabled.value) hoveredStrike.value = null
+}, { deep: false })
 const archive = useRadarArchive()
 const mode = ref<'live' | 'archive'>('live')
 
@@ -595,8 +607,13 @@ function handleMapClick(e: maplibregl.MapMouseEvent) {
   if (e.originalEvent.altKey) void requestTimeseries(e.lngLat)
 }
 
-function handleMapMove() {
-  if ((vcutMode.value || pointMode.value) && map) map.getCanvas().style.cursor = 'crosshair'
+function handleMapMove(e: maplibregl.MapMouseEvent) {
+  const pickingTool = vcutMode.value || pointMode.value
+  if (map) {
+    const onStrike = !pickingTool && !!nearestLightningStrike(e.point)
+    map.getCanvas().style.cursor = pickingTool ? 'crosshair' : onStrike ? 'pointer' : ''
+  }
+  updateLightningHover(e.point)
 }
 
 // Client-side image cache with request de-duplication.
@@ -912,6 +929,7 @@ function refreshProjections() {
   // Repaint in the same frame the positions changed, so the radar tracks
   // the map exactly instead of trailing it while the basemap slides.
   repaintOverlay()
+  drawLightning()
 }
 
 let raf = 0
@@ -1502,18 +1520,9 @@ function initMap(center: [number, number], zoom: number) {
   map.addControl(new maplibregl.AttributionControl({ compact: true }), 'bottom-right')
   // No +/- buttons: the wheel zooms, pinch works, and the UI is cleaner.
   // Keep double-click zoom, which is the remaining pointer affordance.
-  map.on('style.load', ensureLightningLayers)
-  map.on('mouseenter', 'lightning-strikes-point', (e) => {
-    map?.getCanvas().style.setProperty('cursor', 'pointer')
-    handleLightningHover(e)
-  })
-  map.on('mousemove', 'lightning-strikes-point', handleLightningHover)
-  map.on('mouseleave', 'lightning-strikes-point', () => {
-    map?.getCanvas().style.setProperty('cursor', '')
-    handleLightningLeave()
-  })
+  map.on('mouseout', () => { hoveredStrike.value = null })
   map.on('load', () => {
-    ensureLightningLayers()
+    drawLightning()
     if (lightningEnabled.value) startLightningRefresh()
     mapReady.value = true
     applyBasemapTheme()
@@ -1532,7 +1541,7 @@ function initMap(center: [number, number], zoom: number) {
   // corrected itself on release, which read as the radar lagging behind.
   map.on('move', () => scheduleVisibleUpdate())
   map.on('moveend', () => scheduleVisibleUpdate(0))
-  map.on('resize', () => scheduleVisibleUpdate(0))
+  map.on('resize', () => { scheduleVisibleUpdate(0); drawLightning() })
   // Animated moves (zoom buttons, flyTo) fire `move` continuously.
   map.on('move', () => hold())
   map.on('click', handleMapClick)
@@ -2082,6 +2091,13 @@ const tzAbbrev = computed(() => {
     <canvas
       ref="overlayCanvas"
       class="pointer-events-none absolute inset-0 z-[1] h-full w-full"
+      aria-hidden="true"
+    />
+    <!-- Lightning strikes: above the radar frames (z-[1]) and the edge fades
+         (z-[2]), below the UI controls (z-10). -->
+    <canvas
+      ref="lightningCanvas"
+      class="pointer-events-none absolute inset-0 z-[3] h-full w-full"
       aria-hidden="true"
     />
 
