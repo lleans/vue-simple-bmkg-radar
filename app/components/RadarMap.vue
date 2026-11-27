@@ -224,28 +224,32 @@ const viewMode = ref<'all' | 'selected'>('all')
 const selectedStationId = ref<string | null>(null)
 // Station whose dot is under the pointer. Drives the image fade and its name tag.
 const hoveredId = ref<string | null>(null)
-// The `void overlayPos.value` subscribes the computed to every map movement so
-// the projected point tracks the basemap. Doing it before the null-check made
-// these three recompute on every pan frame even when none of the tools were
-// open — a measurable cost on mobile. Returning early first keeps the
-// dependency unregistered until the tool actually produces a point.
+// Every computed here reads its reactive inputs (overlayPos, the point ref)
+// BEFORE the `!map` check. `map` is a plain `let`, so it is not reactive: if
+// the computed first runs before initMap() (it does, during render), an early
+// return would track nothing and stay cached as null forever. Reading the refs
+// first keeps the dependencies registered; overlayPos only changes when the
+// projection changes, so this does not recompute per frame.
 const vcutStartScreen = computed(() => {
-  if (!map || !vcutStart.value) return null
   void overlayPos.value
-  const p = map.project(vcutStart.value)
+  const start = vcutStart.value
+  if (!map || !start) return null
+  const p = map.project(start)
   return { x: p.x, y: p.y }
 })
 const vcutEndScreen = computed(() => {
-  if (!map || !vcutEnd.value) return null
   void overlayPos.value
-  const p = map.project(vcutEnd.value)
+  const end = vcutEnd.value
+  if (!map || !end) return null
+  const p = map.project(end)
   return { x: p.x, y: p.y }
 })
 
 const timeseriesScreen = computed(() => {
-  if (!map || !timeseriesCoords.value) return null
   void overlayPos.value
-  const p = map.project([timeseriesCoords.value.lon, timeseriesCoords.value.lat])
+  const coords = timeseriesCoords.value
+  if (!map || !coords) return null
+  const p = map.project([coords.lon, coords.lat])
   return { x: p.x, y: p.y }
 })
 
