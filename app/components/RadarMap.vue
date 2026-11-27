@@ -17,8 +17,10 @@ import { useRadarTimeline } from '~/composables/useRadarTimeline'
 import { getCachedLocation, lookupUserLocation, inCoverage } from '~/composables/useUserLocation'
 import type { UserLocation } from '~/composables/useUserLocation'
 import RadarStationPicker from '~/components/RadarStationPicker.vue'
+import { geoDistanceKm, STATION_RADIUS_KM } from '~/lib/geo'
 import { createBitmapScaler, useRadarCanvasOverlay, BITMAP_DEFAULT_EDGE, type RadarOverlayStation } from '~/composables/useRadarCanvasOverlay'
 import { HoverCardRoot, HoverCardContent, HoverCardPortal, HoverCardTrigger } from 'reka-ui'
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '~/components/ui/dialog'
 
 const {
   stations,
@@ -53,6 +55,13 @@ const vcutStationId = ref<string | null>(null)
 const vcutLoading = ref(false)
 const vcutError = ref('')
 const vcutResult = ref<RadarVcut | null>(null)
+// Set when the user dismisses the VCUT dialog (Escape, backdrop, × or Dismiss).
+// Keeps a fetch that is still in flight from reopening the dialog on arrival;
+// requestVcut() clears it so a freshly drawn cut always shows.
+const vcutDismissed = ref(false)
+const vcutDialogOpen = computed(() =>
+  (vcutLoading.value || !!vcutResult.value || !!vcutError.value) && !vcutDismissed.value,
+)
 
 // Stations whose 250 km radar coverage intersects the VCUT line midpoint
 const vcutIntersectingStations = computed(() => {
@@ -69,6 +78,26 @@ const timeseriesError = ref('')
 const timeseriesErrorDetail = ref('')
 const timeseriesResult = ref<RadarTimeseries | null>(null)
 const timeseriesCoords = ref<{ lat: number, lon: number } | null>(null)
+
+// Midpoint of the VCUT line (finished result first, then the in-progress
+// start/end points). Anchors the VCUT panel's station picker grouping.
+const vcutAnchor = computed<{ lat: number, lon: number } | null>(() => {
+  if (vcutResult.value) {
+    const r = vcutResult.value
+    return { lat: (r.start_lat + r.stop_lat) / 2, lon: (r.start_lon + r.stop_lon) / 2 }
+  }
+  if (vcutStart.value && vcutEnd.value) {
+    return { lat: (vcutStart.value[1] + vcutEnd.value[1]) / 2, lon: (vcutStart.value[0] + vcutEnd.value[0]) / 2 }
+  }
+  return null
+})
+
+// Point the main station picker groups "In range" stations around: the rain
+// point wins while its panel is open, otherwise the VCUT line midpoint.
+const activeAnchor = computed<{ lat: number, lon: number } | null>(() => {
+  if (timeseriesOpen.value && timeseriesCoords.value) return timeseriesCoords.value
+  return vcutAnchor.value
+})
 const timeseriesStationId = ref<string | null>(null)
 const timeseriesDateOption = ref<'today' | 'yesterday'>('today')
 const pointMode = ref(false)
@@ -129,17 +158,6 @@ const timeseriesScreen = computed(() => {
   return { x: p.x, y: p.y }
 })
 
-// Haversine distance in km between two [lon, lat] points
-function geoDistanceKm(lon1: number, lat1: number, lon2: number, lat2: number): number {
-  const R = 6371
-  const dLat = (lat2 - lat1) * Math.PI / 180
-  const dLon = (lon2 - lon1) * Math.PI / 180
-  const a = Math.sin(dLat / 2) ** 2 +
-    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
-    Math.sin(dLon / 2) ** 2
-  return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
-}
-
 // Stations whose 250km radar coverage intersects the sampled point
 const intersectingStations = computed(() => {
   if (!timeseriesCoords.value) return []
@@ -195,6 +213,9 @@ function vcutStationFor(start: [number, number], end: [number, number]) {
 
 function startVcut() {
   vcutMode.value = true
+  // VCUT and Rain Point are mutually exclusive: entering one leaves the other.
+  // (startPointMode already clears vcutMode; mirror it here.)
+  pointMode.value = false
   vcutStart.value = null
   vcutEnd.value = null
   vcutError.value = ''
@@ -219,7 +240,24 @@ function closeVcutResult() {
   vcutEnd.value = null
 }
 
+// Every way of closing the VCUT dialog (Escape, backdrop, ×, Dismiss) lands
+// here, so the drawn line and endpoints are always cleared with it.
+function dismissVcut() {
+  vcutDismissed.value = true
+  closeVcutResult()
+}
+
+function onVcutDialogOpenChange(open: boolean) {
+  if (!open) dismissVcut()
+}
+
+// "Try again" re-uses the drawn line, which stays set until the dialog closes.
+function retryVcut() {
+  if (vcutStart.value && vcutEnd.value) void requestVcut(vcutStart.value, vcutEnd.value)
+}
+
 async function requestVcut(start: [number, number], end: [number, number]) {
+  vcutDismissed.value = false
   // A manually chosen anchor radar wins over the auto-pick nearest the line.
   const station = vcutStationId.value
     ? stations.value.find(s => s.id === vcutStationId.value) ?? null
@@ -239,6 +277,8 @@ async function requestVcut(start: [number, number], end: [number, number]) {
       datetime: formatUtcMinute(date),
     })
     const res = await $fetch<RadarEnvelope<RadarVcut>>(`${base}/api/vcut/${station.id}?${params}`)
+    // Dismissed while in flight: drop the result so it can't linger as hidden state.
+    if (vcutDismissed.value) return
     if (!res.ok) throw envelopeError(res, 'Could not generate vertical cut.')
     if (!res.data?.image_url || /\/nodata\.png(?:$|\?)/i.test(res.data.image_url)) {
       throw new Error('No vertical-cut data is available for that time. Try a different line or a more recent observation.')
@@ -248,6 +288,7 @@ async function requestVcut(start: [number, number], end: [number, number]) {
     // Surface a short, user-readable message; the raw URL/status stays in
     // the console for debugging.
     console.warn('[radar] vcut failed', e)
+    if (vcutDismissed.value) return
     vcutError.value = friendlyVcutError(e)
   } finally {
     vcutLoading.value = false
@@ -709,12 +750,11 @@ function cacheStats() {
   return { total: imageCache.size, inFlight, done, failed: FAILED_URLS.size }
 }
 
-// Real-world footprint of a station frame: a 4084 px square centred on the
-// radar, edge to edge = 2 x this radius. The handoff doc says "~240 km", but
-// BMKG's own app puts the tips of the long rays in SBY's 03:18Z frame
-// (1,967 px from the image centre) 241-243 km from the radar, which gives
-// 0.123 km/px, i.e. ~250 km to the image edge.
-const STATION_RADIUS_KM = 250
+// STATION_RADIUS_KM (imported from ~/lib/geo) is the real-world footprint of a
+// station frame: a 4084 px square centred on the radar, edge to edge = 2 x this
+// radius. The handoff doc says "~240 km", but BMKG's own app puts the tips of
+// the long rays in SBY's 03:18Z frame (1,967 px from the image centre) 241-243
+// km from the radar, which gives 0.123 km/px, i.e. ~250 km to the image edge.
 // Keep tiny circles visible when zoomed far out.
 const MIN_FRAME_PX = 44
 // Kilometres per degree of longitude at the equator (WGS84 / EPSG:3857 sphere).
@@ -1551,7 +1591,7 @@ const tzAbbrev = computed(() => {
          following the viewport. -->
     <div class="absolute bottom-[4.25rem] left-3 z-10 flex items-center gap-2 sm:bottom-[5.25rem] sm:left-4">
       <RadarProductPicker :model-value="product" @update:model-value="setProduct" />
-      <RadarStationPicker :stations="stations" :model-value="selectedStationId" @update:model-value="pickStation" />
+      <RadarStationPicker :stations="stations" :anchor="activeAnchor" :model-value="selectedStationId" @update:model-value="pickStation" />
     </div>
 
     <!-- Status chip + colour key, bottom-right above the scrubber. The chip
@@ -1635,87 +1675,75 @@ const tzAbbrev = computed(() => {
       <button type="button" class="shrink-0 rounded-full border border-border/60 px-2 py-1 text-[11px] font-medium tabular-nums text-foreground/75 transition-colors hover:bg-foreground/10 hover:text-foreground" aria-label="Animation speed" @click="cycleSpeed">{{ speedLabel }}</button>
     </div>
 
-    <Transition name="pill">
-      <div v-if="vcutLoading" class="pointer-events-auto absolute left-1/2 top-1/2 z-30 -translate-x-1/2 -translate-y-1/2">
-        <div class="flex items-center gap-3 rounded-2xl border border-border/60 bg-card/95 px-4 py-3 text-sm shadow-2xl shadow-black/30 backdrop-blur-xl" role="status" aria-live="polite">
+    <!-- Vertical cut: ONE modal for the whole flow (loading / error / result).
+         Every dismiss path (Escape, backdrop, ×, Dismiss) runs
+         dismissVcut(), which also clears the drawn line and endpoints. -->
+    <Dialog :open="vcutDialogOpen" @update:open="onVcutDialogOpenChange">
+      <DialogContent class="max-w-3xl">
+        <DialogHeader class="pr-6">
+          <DialogTitle class="text-base leading-snug">
+            Vertical cross-section
+            <template v-if="vcutResult"> · {{ vcutResult.station }} · {{ new Date(vcutResult.datetime_utc).toLocaleString() }}</template>
+          </DialogTitle>
+          <DialogDescription>Reflectivity in dBZ along the drawn line.</DialogDescription>
+          <div v-if="vcutResult" class="mt-1 flex items-center gap-1.5">
+            <span class="text-[11px] text-muted-foreground">Radar:</span>
+            <!-- Station selector for the cut line, using the project's
+                 shadcn-vue / reka-ui RadarStationPicker (same as the
+                 Rain Perception panel). null = auto-pick nearest. -->
+            <RadarStationPicker
+              :stations="stations"
+              :anchor="vcutAnchor"
+              :model-value="vcutResult.station"
+              @update:model-value="(id: string | null) => { const next = id ?? vcutResult?.station; if (next) setVcutStation(next) }"
+            />
+          </div>
+        </DialogHeader>
+
+        <div v-if="vcutLoading" class="flex items-center justify-center gap-3 py-10 text-sm" role="status" aria-live="polite">
           <span class="inline-block size-4 animate-spin rounded-full border-2 border-foreground/20 border-t-foreground" aria-hidden="true" />
           <span>Generating vertical cut…</span>
         </div>
-      </div>
-    </Transition>
-    <Transition name="pill">
-      <div v-if="vcutError" class="pointer-events-auto absolute left-1/2 top-1/2 z-30 w-[min(22rem,calc(100%-2rem))] -translate-x-1/2 -translate-y-1/2">
-        <div class="flex items-start gap-3 rounded-2xl border border-destructive/50 bg-card/95 p-4 text-sm shadow-2xl shadow-black/40 backdrop-blur-xl" role="alert">
+        <div v-else-if="vcutError" class="flex items-start gap-3 text-sm" role="alert">
           <svg viewBox="0 0 20 20" class="mt-0.5 size-4 shrink-0 fill-destructive" aria-hidden="true">
             <path d="M10 18a8 8 0 1 0 0-16 8 8 0 0 0 0 16zm-.75-11.5a.75.75 0 0 1 1.5 0v4.25a.75.75 0 0 1-1.5 0V6.5zm.75 7.5a1 1 0 1 1 0-2 1 1 0 0 1 0 2z" />
           </svg>
           <div class="min-w-0 flex-1">
-            <p class="text-sm font-medium text-foreground">Couldn't generate the vertical cut</p>
+            <p class="font-medium text-foreground">Couldn't generate the vertical cut</p>
             <p class="mt-1 text-xs leading-relaxed text-muted-foreground">{{ vcutError }}</p>
             <div class="mt-3 flex items-center gap-2">
-              <button type="button" class="rounded-full border border-border/60 bg-foreground/5 px-2.5 py-1 text-[11px] font-medium text-foreground hover:bg-foreground/10" @click="vcutStart && vcutEnd && void requestVcut(vcutStart, vcutEnd); vcutError = ''">Try again</button>
-              <button type="button" class="rounded-full px-2.5 py-1 text-[11px] font-medium text-muted-foreground hover:bg-foreground/5" @click="closeVcutResult">Dismiss</button>
+              <button type="button" class="rounded-full border border-border/60 bg-foreground/5 px-2.5 py-1 text-[11px] font-medium text-foreground hover:bg-foreground/10" @click="retryVcut">Try again</button>
+              <button type="button" class="rounded-full px-2.5 py-1 text-[11px] font-medium text-muted-foreground hover:bg-foreground/5" @click="dismissVcut">Dismiss</button>
             </div>
           </div>
         </div>
-      </div>
-    </Transition>
-    <Transition name="pill">
-      <div v-if="vcutResult" class="pointer-events-auto absolute left-3 right-3 top-3 z-30 sm:left-1/2 sm:right-auto sm:w-[min(46rem,calc(100%-2rem))] sm:-translate-x-1/2 sm:top-16">
-        <div class="overflow-hidden rounded-2xl border border-border/60 bg-card/95 shadow-2xl shadow-black/40 ring-1 ring-black/5 backdrop-blur-xl">
-          <div class="flex items-center justify-between gap-3 border-b border-border/50 px-3 py-2.5 text-xs">
-            <span class="truncate font-medium">Vertical cross-section · {{ vcutResult.station }} · {{ new Date(vcutResult.datetime_utc).toLocaleString() }}</span>
-            <div class="flex shrink-0 items-center gap-1.5">
-              <span class="text-[11px] text-muted-foreground">Radar:</span>
-              <!-- Station selector for the cut line, using the project's
-                   shadcn-vue / reka-ui RadarStationPicker (same as the
-                   Rain Perception panel). null = auto-pick nearest. -->
-              <RadarStationPicker
-                :stations="stations"
-                :model-value="vcutResult?.station ?? vcutStationId"
-                @update:model-value="(id: string | null) => setVcutStation(id ?? vcutResult.station)"
-              />
-            </div>
-            <button type="button" aria-label="Close vertical cross-section" class="shrink-0 rounded-full px-2 py-0.5 text-muted-foreground hover:bg-foreground/10" @click="closeVcutResult">×</button>
-          </div>
-          <div class="max-h-[55vh] overflow-y-auto bg-background/40 p-2 sm:p-3">
-            <img :src="vcutResult.image_url" alt="Vertical radar cross-section in dBZ" referrerpolicy="no-referrer" class="block w-full rounded-lg object-contain" />
-          </div>
+        <!-- Inner scroll container keeps the header and × visible on tall images. -->
+        <div v-else-if="vcutResult" class="max-h-[55vh] overflow-y-auto rounded-lg bg-background/40 p-2 sm:p-3">
+          <img :src="vcutResult.image_url" alt="Vertical radar cross-section in dBZ" referrerpolicy="no-referrer" class="block w-full rounded-lg object-contain" />
         </div>
-      </div>
-    </Transition>
+      </DialogContent>
+    </Dialog>
 
-    <Transition name="pill">
-      <div
-        v-if="timeseriesOpen"
-        class="absolute left-3 right-3 top-16 z-30 mx-auto max-w-lg rounded-2xl border border-border/60 bg-card/95 p-4 shadow-2xl backdrop-blur-xl sm:left-1/2 sm:right-auto sm:w-[min(34rem,calc(100%-2rem))] sm:-translate-x-1/2"
-      >
-        <div class="flex items-start justify-between gap-3 border-b border-border/40 pb-3">
-          <div>
-            <div class="flex items-center gap-2">
-              <span class="inline-block size-2 rounded-full bg-primary" />
-              <p class="text-sm font-semibold tracking-tight">Rain Perception · Point Timeseries</p>
-            </div>
-            <p v-if="timeseriesCoords" class="mt-0.5 font-mono text-[11px] text-muted-foreground">
-              {{ timeseriesCoords.lat >= 0 ? '+' : '' }}{{ timeseriesCoords.lat.toFixed(3) }}°,
-              {{ timeseriesCoords.lon >= 0 ? '+' : '' }}{{ timeseriesCoords.lon.toFixed(3) }}°
-              <span v-if="timeseriesStationId" class="text-foreground/75">· Anchor: {{ timeseriesStationId }}</span>
-            </p>
-            <p v-else class="mt-0.5 text-[11px] text-muted-foreground">
-              Alt-click anywhere on the map to sample that point.
-            </p>
-          </div>
-          <button
-            type="button"
-            aria-label="Close point timeseries"
-            class="rounded-full p-1 text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
-            @click="closeTimeseries"
-          >
-            <svg viewBox="0 0 16 16" class="size-4" fill="none" stroke="currentColor" stroke-width="1.75">
-              <path d="M4 4l8 8M12 4l-8 8" stroke-linecap="round" />
-            </svg>
-          </button>
-        </div>
+    <!-- Rain Perception: ONE modal. Every dismiss path (Escape, backdrop, ×)
+         runs closeTimeseries(); the single × is DialogContent's own. -->
+    <Dialog :open="timeseriesOpen" @update:open="(o: boolean) => { if (!o) closeTimeseries() }">
+      <DialogContent>
+        <DialogHeader class="pr-6">
+          <DialogTitle class="flex items-center gap-2 text-sm leading-snug tracking-tight">
+            <span class="inline-block size-2 shrink-0 rounded-full bg-primary" />
+            Rain Perception · Point Timeseries
+          </DialogTitle>
+          <DialogDescription class="text-[11px]">
+            <span v-if="timeseriesCoords">
+              <span class="font-mono">
+                {{ timeseriesCoords.lat >= 0 ? '+' : '' }}{{ timeseriesCoords.lat.toFixed(3) }}°,
+                {{ timeseriesCoords.lon >= 0 ? '+' : '' }}{{ timeseriesCoords.lon.toFixed(3) }}°
+              </span>
+              <span v-if="timeseriesStationId" class="text-foreground/75"> · Anchor: {{ timeseriesStationId }}</span>
+            </span>
+            <template v-else>Alt-click anywhere on the map to sample that point.</template>
+          </DialogDescription>
+        </DialogHeader>
 
         <!-- Timeseries API Controls: Station & Date Picker -->
         <div class="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs">
@@ -1745,8 +1773,9 @@ const tzAbbrev = computed(() => {
             <span class="text-[11px] text-muted-foreground">Radar:</span>
             <RadarStationPicker
               :stations="stations"
+              :anchor="timeseriesCoords"
               :model-value="timeseriesStationId"
-              @update:model-value="(id: string | null) => setTimeseriesStation(id ?? timeseriesStationId.value ?? '')"
+              @update:model-value="(id: string | null) => setTimeseriesStation(id ?? timeseriesStationId ?? '')"
             />
           </div>
         </div>
@@ -1834,8 +1863,8 @@ const tzAbbrev = computed(() => {
             No point readings recorded for this date.
           </p>
         </div>
-      </div>
-    </Transition>
+      </DialogContent>
+    </Dialog>
 
     <Transition name="pill">
       <div v-if="vcutMode" class="pointer-events-none absolute inset-x-3 top-3 z-20 flex justify-center sm:inset-x-4 sm:top-4">
