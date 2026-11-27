@@ -5,27 +5,37 @@ import {
   ComboboxAnchor,
   ComboboxContent,
   ComboboxEmpty,
+  ComboboxGroup,
   ComboboxInput,
   ComboboxItem,
   ComboboxItemIndicator,
+  ComboboxLabel,
   ComboboxPortal,
   ComboboxRoot,
   ComboboxTrigger,
   ComboboxViewport,
 } from 'reka-ui'
 import type { RadarStation } from '~/composables/useRadarApi'
+import { groupStationsByRange, type GeoPoint } from '~/lib/geo'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   stations: RadarStation[]
   // null = all stations
   modelValue: string | null
-}>()
+  // When set, options are grouped into "In range" / "Other stations".
+  // null = flat list.
+  anchor?: GeoPoint | null
+}>(), {
+  anchor: null,
+})
 const emit = defineEmits<{ 'update:modelValue': [id: string | null] }>()
 
 // Combobox values can't be null, so "all stations" gets a sentinel.
 const ALL = '__all'
 
 const value = computed(() => props.modelValue ?? ALL)
+
+const grouped = computed(() => groupStationsByRange(props.stations, props.anchor ?? null))
 
 const labelOf = (v: unknown) => {
   if (v === ALL || v == null) return 'All stations'
@@ -44,6 +54,8 @@ function selectAll(e: FocusEvent) {
 
 const itemClass =
   'relative flex cursor-default select-none items-center gap-2 rounded-lg py-1.5 pl-7 pr-2 text-xs outline-none data-[highlighted]:bg-accent data-[highlighted]:text-accent-foreground'
+const labelClass =
+  'px-2 pb-1 pt-2 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground'
 </script>
 
 <template>
@@ -90,19 +102,56 @@ const itemClass =
             </ComboboxItemIndicator>
             <span class="font-medium">All stations</span>
           </ComboboxItem>
-          <ComboboxItem
-            v-for="s in stations"
-            :key="s.id"
-            :value="s.id"
-            :text-value="`${s.id} ${s.name}`"
-            :class="itemClass"
-          >
-            <ComboboxItemIndicator class="absolute left-2">
-              <Check class="size-3.5" />
-            </ComboboxItemIndicator>
-            <span class="w-10 shrink-0 font-mono font-medium">{{ s.id }}</span>
-            <span class="truncate text-[11px] text-muted-foreground">{{ s.name }}</span>
-          </ComboboxItem>
+          <template v-if="anchor">
+            <ComboboxGroup v-if="grouped.inRange.length">
+              <ComboboxLabel :class="labelClass">In range</ComboboxLabel>
+              <ComboboxItem
+                v-for="s in grouped.inRange"
+                :key="s.id"
+                :value="s.id"
+                :text-value="`${s.id} ${s.name}`"
+                :class="itemClass"
+              >
+                <ComboboxItemIndicator class="absolute left-2">
+                  <Check class="size-3.5" />
+                </ComboboxItemIndicator>
+                <span class="w-10 shrink-0 font-mono font-medium">{{ s.id }}</span>
+                <span class="truncate text-[11px] text-muted-foreground">{{ s.name }}</span>
+                <span class="ml-auto shrink-0 pl-2 text-[11px] tabular-nums text-muted-foreground">{{ Math.round(s.distKm) }} km</span>
+              </ComboboxItem>
+            </ComboboxGroup>
+            <ComboboxGroup v-if="grouped.other.length">
+              <ComboboxLabel :class="labelClass">Other stations</ComboboxLabel>
+              <ComboboxItem
+                v-for="s in grouped.other"
+                :key="s.id"
+                :value="s.id"
+                :text-value="`${s.id} ${s.name}`"
+                :class="itemClass"
+              >
+                <ComboboxItemIndicator class="absolute left-2">
+                  <Check class="size-3.5" />
+                </ComboboxItemIndicator>
+                <span class="w-10 shrink-0 font-mono font-medium">{{ s.id }}</span>
+                <span class="truncate text-[11px] text-muted-foreground">{{ s.name }}</span>
+              </ComboboxItem>
+            </ComboboxGroup>
+          </template>
+          <template v-else>
+            <ComboboxItem
+              v-for="s in stations"
+              :key="s.id"
+              :value="s.id"
+              :text-value="`${s.id} ${s.name}`"
+              :class="itemClass"
+            >
+              <ComboboxItemIndicator class="absolute left-2">
+                <Check class="size-3.5" />
+              </ComboboxItemIndicator>
+              <span class="w-10 shrink-0 font-mono font-medium">{{ s.id }}</span>
+              <span class="truncate text-[11px] text-muted-foreground">{{ s.name }}</span>
+            </ComboboxItem>
+          </template>
         </ComboboxViewport>
       </ComboboxContent>
     </ComboboxPortal>
