@@ -66,7 +66,7 @@ const labelClass =
     @update:model-value="onUpdate"
   >
     <ComboboxAnchor
-      class="flex h-8 w-44 items-center gap-2 rounded-full border border-border/60 bg-card/80 pl-3 pr-2 text-xs shadow-lg backdrop-blur-xl transition-colors focus-within:bg-card hover:bg-card sm:w-56"
+      class="flex h-8 w-44 items-center gap-2 rounded-full border border-border/60 bg-card/95 pl-3 pr-2 text-xs shadow-lg transition-colors focus-within:bg-card hover:bg-card sm:w-56 sm:bg-card/80 sm:backdrop-blur-xl"
     >
       <MapPin class="size-3.5 shrink-0 text-foreground/60" />
       <ComboboxInput

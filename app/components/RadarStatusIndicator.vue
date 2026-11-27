@@ -64,7 +64,7 @@ const panelEmpty = computed(() =>
     <HoverCardRoot :open-delay="140" :close-delay="120">
       <HoverCardTrigger as-child>
         <div
-          class="flex w-fit cursor-default items-center gap-1.5 rounded-full border border-border/60 bg-card/90 py-1 pl-1.5 pr-2 text-[10px] font-medium text-foreground/80 shadow-md backdrop-blur-xl"
+          class="flex w-fit cursor-default items-center gap-1.5 rounded-full border border-border/60 bg-card/95 py-1 pl-1.5 pr-2 text-[10px] font-medium text-foreground/80 shadow-md sm:bg-card/90 sm:backdrop-blur-xl"
           :style="{ '--sev': RADAR_STATUS_COLORS.severe }"
           :role="state === 'failed' ? 'alert' : 'status'"
           :aria-label="ariaLabel"
