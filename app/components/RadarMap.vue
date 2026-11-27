@@ -10,7 +10,7 @@ import type { Map as MaplibreMap, StyleSpecification } from 'maplibre-gl'
 // map renders empty. Importing it with ?url makes Vite emit it as an asset,
 // and setWorkerUrl points MapLibre at the emitted copy.
 import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?url'
-import { useRadarApi, type RadarFrame, type RadarStation, type RadarTimeseries, type RadarVcut } from '~/composables/useRadarApi'
+import { useRadarApi, zoomToResolution, type RadarFrame, type RadarStation, type RadarTimeseries, type RadarVcut } from '~/composables/useRadarApi'
 import { useRadarArchive } from '~/composables/useRadarArchive'
 import { radarProductInfo } from '~/composables/radarProducts'
 import { useRadarTimeline } from '~/composables/useRadarTimeline'
@@ -36,6 +36,7 @@ const {
   product,
   setProduct,
   fetchProducts,
+  resolution,
   base,
 } = useRadarApi()
 const archive = useRadarArchive()
@@ -138,22 +139,27 @@ const viewMode = ref<'all' | 'selected'>('all')
 const selectedStationId = ref<string | null>(null)
 // Station whose dot is under the pointer. Drives the image fade and its name tag.
 const hoveredId = ref<string | null>(null)
+// The `void overlayPos.value` subscribes the computed to every map movement so
+// the projected point tracks the basemap. Doing it before the null-check made
+// these three recompute on every pan frame even when none of the tools were
+// open — a measurable cost on mobile. Returning early first keeps the
+// dependency unregistered until the tool actually produces a point.
 const vcutStartScreen = computed(() => {
-  void overlayPos.value
   if (!map || !vcutStart.value) return null
+  void overlayPos.value
   const p = map.project(vcutStart.value)
   return { x: p.x, y: p.y }
 })
 const vcutEndScreen = computed(() => {
-  void overlayPos.value
   if (!map || !vcutEnd.value) return null
+  void overlayPos.value
   const p = map.project(vcutEnd.value)
   return { x: p.x, y: p.y }
 })
 
 const timeseriesScreen = computed(() => {
-  void overlayPos.value
   if (!map || !timeseriesCoords.value) return null
+  void overlayPos.value
   const p = map.project([timeseriesCoords.value.lon, timeseriesCoords.value.lat])
   return { x: p.x, y: p.y }
 })
@@ -275,6 +281,7 @@ async function requestVcut(start: [number, number], end: [number, number]) {
       start_lat: String(start[1]), start_lon: String(start[0]),
       stop_lat: String(end[1]), stop_lon: String(end[0]),
       datetime: formatUtcMinute(date),
+      resolution: resolution.value,
     })
     const res = await $fetch<RadarEnvelope<RadarVcut>>(`${base}/api/vcut/${station.id}?${params}`)
     // Dismissed while in flight: drop the result so it can't linger as hidden state.
@@ -541,6 +548,7 @@ const MAX_CACHED = 600
 const WARM_AHEAD = 2
 // Cache of URLs that failed, so we don't retry a broken frame every tick.
 const FAILED_URLS = new Map<string, number>()
+const proxyFallbacks = new Map<string, string>()
 const failedImageStations = ref<Record<string, true>>({})
 // A failed frame is retried only after this long (frames can appear later).
 const FAIL_RETRY_MS = 5 * 60 * 1000
@@ -644,6 +652,14 @@ function startLoad(url: string, entry: CacheEntry) {
           if (settled || imageCache.get(url) !== entry) return
           img.src = url
         }, delay)
+        return
+      }
+      const fallback = proxyFallbacks.get(url)
+      if (fallback) {
+        proxyFallbacks.delete(url)
+        imageCache.delete(url)
+        done()
+        loadImage(fallback)
         return
       }
       entry.failed = true
@@ -1070,7 +1086,10 @@ function warmVisible() {
     if (isStaleLive(id)) continue
     for (let off = 0; off <= WARM_AHEAD; off++) {
       const f = targetFrameFor(id, frameIdx.value + off)
-      if (f?.url) loadImage(f.url)
+      if (f?.url) {
+        if (f.url_original) proxyFallbacks.set(f.url, f.url_original)
+        loadImage(f.url)
+      }
     }
   }
 }
@@ -1198,9 +1217,13 @@ const overlay = useRadarCanvasOverlay(
 )
 
 // Let the projection refresh drive the repaint, so panning/zooming moves the
-// radar with the basemap in the same frame. Map movement uses the unthrottled
-// path; a 30fps cap would make the radar trail a 60fps pan.
-repaintOverlay = overlay.scheduleImmediate
+// radar with the basemap in the same frame. Desktop uses the unthrottled path
+// so the radar does not trail a 60fps pan. Phones cannot keep up with that
+// and were the worst place to see jank; the 30fps throttled path is cheap
+// enough to run a full pan and the basemap and radar still move together.
+repaintOverlay = (typeof window !== 'undefined' && window.innerWidth < 640)
+  ? overlay.schedule
+  : overlay.scheduleImmediate
 
 // Resolution: the backing bitmap should match how large the frames are
 // actually DRAWN, so key it to on-screen size — not to how many stations
@@ -1218,8 +1241,13 @@ function targetEdgeFor(stations: { size: number }[]): number {
   const budget = 6 * 1024 * 1024
   const share = budget / stations.length
   const cap = Math.sqrt(share)
+  // Phones draw the frames much smaller than desktop and cannot absorb 4 MB
+  // per station of texture upload; cap the floor lower there.
+  const floor = (typeof window !== 'undefined' && window.innerWidth < 640)
+    ? 640
+    : BITMAP_DEFAULT_EDGE
   // Never upscale past the 4084px source, and never drop below the floor.
-  return Math.min(biggest, 4084, Math.max(BITMAP_DEFAULT_EDGE, cap))
+  return Math.min(biggest, 4084, Math.max(floor, cap))
 }
 
 watch([visibleIds, viewportSize], () => {
@@ -1235,6 +1263,17 @@ watch([visibleIds, viewportSize], () => {
     warmVisible()
   }
 }, { deep: false })
+
+watch(resolution, () => {
+  productsByStation.value = {}
+  for (const url of [...imageCache.keys()]) {
+    imageCache.delete(url)
+    bitmapScaler.dispose(url)
+  }
+  FAILED_URLS.clear()
+  proxyFallbacks.clear()
+  if (visibleIds.value.size) fetchProducts([...visibleIds.value])
+})
 
 // Repaint when anything the overlay draws from changes.
 watch([frameIdx, visibleIds, productsByStation, imageEpoch, viewMode, selectedStationId, hoverTick], () => {
@@ -1352,6 +1391,7 @@ function initMap(center: [number, number], zoom: number) {
   // pointer is over a station dot (see setDotHover) so the wheel scrolls the
   // page instead of zooming the map from that spot.
   map.scrollZoom.enable()
+  resolution.value = zoomToResolution(zoom)
 
   // Lock to 2D. MapLibre maps right-drag to pitch/tilt, which makes the map
   // rotate into 3D; a weather overlay should stay flat. Also clear anything
@@ -1374,6 +1414,7 @@ function initMap(center: [number, number], zoom: number) {
   })
   map.on('move', rafRefresh)
   map.on('zoom', rafRefresh)
+  map.on('zoom', () => { resolution.value = zoomToResolution(map!.getZoom()) })
   map.on('resize', rafRefresh)
   // Re-evaluate which stations are in view once a move settles.
   // Track the visible set *during* the pan as well as at the end. Without the
@@ -1614,7 +1655,7 @@ const tzAbbrev = computed(() => {
     </div>
 
     <!-- Combined action + player row: keep animation controls visible beside VCUT/nowcast. -->
-    <div class="absolute inset-x-3 bottom-3 z-10 flex min-w-0 items-center gap-2 rounded-2xl border border-border/60 bg-card/80 px-3 py-2 pe-14 shadow-2xl backdrop-blur-xl sm:inset-x-4 sm:bottom-4 sm:gap-3 sm:px-4 sm:py-2.5 sm:pe-16">
+    <div class="absolute inset-x-3 bottom-3 z-10 flex min-w-0 items-center gap-2 rounded-2xl border border-border/60 bg-card/95 px-3 py-2 pe-14 shadow-xl sm:inset-x-4 sm:bottom-4 sm:gap-3 sm:bg-card/80 sm:px-4 sm:py-2.5 sm:pe-16 sm:shadow-2xl sm:backdrop-blur-xl">
       <HoverCardRoot :open-delay="200" :close-delay="120">
         <HoverCardTrigger as-child>
           <button type="button" aria-label="Map tools: vertical cut and point nowcast" :aria-pressed="vcutMode" class="flex h-7 shrink-0 items-center gap-1 rounded-full border px-2 text-[10px] font-medium transition-colors sm:h-8 sm:gap-1.5 sm:px-2.5 sm:text-[11px]" :class="vcutMode ? 'border-primary bg-primary text-primary-foreground' : 'border-border/60 text-foreground/75 hover:bg-foreground/10'" @click="vcutMode ? cancelVcut() : startVcut()">
@@ -1719,7 +1760,7 @@ const tzAbbrev = computed(() => {
         </div>
         <!-- Inner scroll container keeps the header and × visible on tall images. -->
         <div v-else-if="vcutResult" class="max-h-[55vh] overflow-y-auto rounded-lg bg-background/40 p-2 sm:p-3">
-          <img :src="vcutResult.image_url" alt="Vertical radar cross-section in dBZ" referrerpolicy="no-referrer" class="block w-full rounded-lg object-contain" />
+          <img :src="vcutResult.image_url" alt="Vertical radar cross-section in dBZ" referrerpolicy="no-referrer" class="block w-full rounded-lg object-contain" @error="(e: Event) => { if (vcutResult!.image_url_original) { (e.target as HTMLImageElement).src = vcutResult!.image_url_original } }" />
         </div>
       </DialogContent>
     </Dialog>
@@ -1904,7 +1945,7 @@ const tzAbbrev = computed(() => {
           ? visibleStations.filter(ss => ss.id === selectedStationId)
           : visibleStations"
         :key="s.id"
-        class="absolute will-change-transform"
+        class="absolute sm:will-change-transform"
         :style="{
           transform: `translate3d(${posOf(s.id).x}px, ${posOf(s.id).y}px, 0) translate(-50%, -50%)`,
           width: `${posOf(s.id).size || frameSize}px`,
@@ -1931,7 +1972,7 @@ const tzAbbrev = computed(() => {
               class="h-1.5 w-1.5 rounded-full sm:h-2 sm:w-2"
               :class="stationStatus[s.id]?.noData
                 ? 'bg-yellow-400'
-                : 'bg-foreground shadow-[0_0_6px_2px_oklab(1_0_0/0.55)]'"
+                : 'bg-foreground shadow-[0_0_3px_1px_oklab(1_0_0/0.4)] sm:shadow-[0_0_6px_2px_oklab(1_0_0/0.55)]'"
             />
           </div>
           <!-- Name tag above the dot while hovered. The wrapper keeps the
