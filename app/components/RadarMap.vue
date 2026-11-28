@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, shallowRef, computed, onMounted, onUnmounted, watch } from 'vue'
+import { ref, shallowRef, computed, nextTick, onMounted, onUnmounted, watch } from 'vue'
 import * as maplibregl from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import type { Map as MaplibreMap, StyleSpecification } from 'maplibre-gl'
@@ -13,7 +13,8 @@ import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?url'
 import { useRadarApi, zoomToResolution, type RadarFrame, type RadarStation, type RadarTimeseries, type RadarVcut } from '~/composables/useRadarApi'
 import { useLightning, type LightningStrike } from '~/composables/useLightning'
 import { useRadarArchive } from '~/composables/useRadarArchive'
-import { radarProductInfo } from '~/composables/radarProducts'
+import { RADAR_SCALES, radarProductInfo } from '~/composables/radarProducts'
+import { mosaicIndexEdge, mosaicPaletteFor } from '~/lib/radarMosaic'
 import { useRadarTimeline } from '~/composables/useRadarTimeline'
 import { getCachedLocation, lookupUserLocation, inCoverage } from '~/composables/useUserLocation'
 import type { UserLocation } from '~/composables/useUserLocation'
@@ -714,14 +715,26 @@ let inFlight = 0
 // This is deliberately per-request, not a page-wide <meta name="referrer">,
 // because the OSM tile servers expect a Referer.
 //
-// Radar images are also always requested in plain (no-CORS) mode, never with
-// `crossorigin`. A <img> doesn't need CORS to display, and mixing modes for
-// one URL breaks: the cached no-CORS copy has no CORS headers, so a later
-// CORS-mode request for the same URL fails.
+// Proxied frames (wsrv.nl) are requested in CORS mode: the WebGL mosaic reads
+// their pixels back, and wsrv answers with access-control-allow-origin: *.
+// Upstream frames (url_original, and full-resolution `url`, which is the
+// bucket itself) are requested without CORS, because the bucket allows only
+// localhost:3000 and a CORS request would fail in production. Each URL keeps
+// one mode for its whole life, so a cached response is never reused across
+// modes.
+function isCorsProxiedFrame(url: string): boolean {
+  try {
+    return new URL(url).hostname === 'wsrv.nl'
+  } catch {
+    return false
+  }
+}
+
 function startLoad(url: string, entry: CacheEntry) {
   const img = new Image()
   img.decoding = 'async'
   img.referrerPolicy = 'no-referrer'
+  if (isCorsProxiedFrame(url)) img.crossOrigin = 'anonymous'
   entry.img = img
   inFlight++
   // Only a URL that actually starts going over the wire is counted, and its
@@ -908,38 +921,87 @@ function frameSizePx(mapRef: MaplibreMap, lon: number, lat: number): number {
 const overlayPos = ref<Record<string, { x: number; y: number; size: number }>>({})
 const viewportSize = ref({ w: 0, h: 0 })
 
-// Assigned once the overlay canvas is created. refreshProjections() runs on
-// every map move, so the radar repaint has to happen there too.
-let repaintOverlay: () => void = () => {}
+// Station positions for the current camera, as plain data. They are written
+// from MapLibre's 'render' event, which fires after the basemap is drawn in
+// that frame, so the radar and the station badges move with the basemap in
+// the same frame. Not reactive: a pan does not re-render any Vue component.
+const framePos = new Map<string, { x: number; y: number; size: number }>()
+let framePosCamera = ''
+let framePosStations: unknown = null
+// Last width/height written per badge, so a pan only writes transforms.
+const badgeSize = new Map<string, number>()
 
-function refreshProjections() {
-  if (!map) return
+function cameraKey(): string {
+  if (!map) return ''
+  const c = map.getCenter()
+  const cv = map.getCanvas()
+  return `${map.getZoom()},${c.lng},${c.lat},${map.getBearing()},${map.getPitch()},${cv.clientWidth}x${cv.clientHeight}`
+}
+
+// Project every station for the current camera. Returns false, doing no work,
+// when neither the camera nor the station list changed since the last call.
+function projectStations(): boolean {
+  if (!map) return false
+  const key = cameraKey()
+  if (key === framePosCamera && stations.value === framePosStations) return false
+  framePosCamera = key
+  framePosStations = stations.value
+  framePos.clear()
+  for (const s of stations.value) {
+    // MapLibre's own projection: exactly where the basemap draws this coordinate.
+    const p = map.project([s.lon, s.lat])
+    framePos.set(s.id, { x: p.x, y: p.y, size: frameSizePx(map, s.lon, s.lat) })
+  }
+  return true
+}
+
+// Move the station badges by writing their styles directly, not through Vue.
+const badgeLayer = ref<HTMLElement | null>(null)
+function applyBadgePositions() {
+  const root = badgeLayer.value
+  if (!root) return
+  for (const el of root.querySelectorAll<HTMLElement>('[data-station-badge]')) {
+    const id = el.dataset.stationBadge
+    const p = id ? framePos.get(id) : undefined
+    if (!id || !p) continue
+    const size = p.size || frameSize.value
+    el.style.transform = `translate3d(${p.x}px, ${p.y}px, 0) translate(-50%, -50%)`
+    if (badgeSize.get(id) !== size) {
+      badgeSize.set(id, size)
+      el.style.width = `${size}px`
+      el.style.height = `${size}px`
+    }
+  }
+}
+
+// Vue-driven overlay markers (VCUT points, rain point, lightning card) read
+// overlayPos. Only write it when one of them is on screen, or when the map
+// has settled; a plain pan does not touch Vue.
+function markersOnScreen(): boolean {
+  return !!(vcutStart.value || vcutEnd.value || timeseriesCoords.value || hoveredStrike.value)
+}
+
+// settled = true on load, resize, and after a move ends: always writes Vue state.
+function refreshProjections(settled = false): boolean {
+  if (!map) return false
   const canvas = map.getCanvas()
   const w = canvas.clientWidth
   const h = canvas.clientHeight
   if (w !== viewportSize.value.w || h !== viewportSize.value.h) viewportSize.value = { w, h }
-  const prev = overlayPos.value
-  const next: Record<string, { x: number; y: number; size: number }> = {}
-  let changed = Object.keys(prev).length !== stations.value.length
-  for (const s of stations.value) {
-    // MapLibre's own projection: exactly where the basemap draws this coordinate.
-    const p = map.project([s.lon, s.lat])
-    const size = frameSizePx(map, s.lon, s.lat)
-    const old = prev[s.id]
-    if (!old || old.x !== p.x || old.y !== p.y || old.size !== size) changed = true
-    next[s.id] = { x: p.x, y: p.y, size }
-  }
-  if (changed) overlayPos.value = next
-  // Repaint in the same frame the positions changed, so the radar tracks
-  // the map exactly instead of trailing it while the basemap slides.
-  repaintOverlay()
-  drawLightning()
+  const moved = projectStations()
+  if (!moved && !settled) return false
+  if (settled || markersOnScreen()) overlayPos.value = Object.fromEntries(framePos)
+  applyBadgePositions()
+  return moved
 }
 
-let raf = 0
-function rafRefresh() {
-  cancelAnimationFrame(raf)
-  raf = requestAnimationFrame(refreshProjections)
+// Runs after every rendered frame: when the camera moved, reposition the
+// badges and repaint the radar in this same frame, then the lightning layer.
+function onRender() {
+  if (!map) return
+  if (!refreshProjections()) return
+  overlay.paintNow()
+  drawLightning()
 }
 
 // Only stations near the viewport are fetched, rendered and cached; the rest
@@ -963,7 +1025,7 @@ function updateVisible() {
   if (!w || !h) return
   const next = new Set<string>()
   for (const s of stations.value) {
-    const p = overlayPos.value[s.id]
+    const p = framePos.get(s.id)
     if (!p) continue
     // Check intersection of the station radar footprint (radius = size / 2)
     // with the active viewport (expanded by VIEW_MARGIN_PX).
@@ -981,6 +1043,8 @@ function updateVisible() {
 }
 
 const visibleStations = computed(() => stations.value.filter(s => visibleIds.value.has(s.id)))
+// New badges appear when the visible set changes: place them right away.
+watch(visibleStations, () => nextTick(applyBadgePositions))
 
 // Recompute which stations are in view. This also decides what gets fetched,
 // so it is debounced: a pan fires `move` continuously and re-testing every
@@ -990,7 +1054,7 @@ function scheduleVisibleUpdate(delay = 100) {
   if (visibleTimer) clearTimeout(visibleTimer)
   visibleTimer = setTimeout(() => {
     visibleTimer = null
-    refreshProjections()
+    refreshProjections(true)
     updateVisible()
   }, delay)
 }
@@ -1009,7 +1073,7 @@ function setupResizeObserver() {
   resizeObserver = new ResizeObserver((entries) => {
     // Fire a map resize + projection refresh on any layout change
     map?.resize()
-    refreshProjections()
+    refreshProjections(true)
     scheduleVisibleUpdate()
   })
   resizeObserver.observe(mapContainer.value)
@@ -1304,7 +1368,7 @@ function isStaleLive(stationId: string): boolean {
 function stationHasNoData(stationId: string): boolean {
   const target = targetFrameFor(stationId, frameIdx.value)
   if (!target?.url) return true
-  if (/\/nodata\.png(?:$|\?)/i.test(target.url)) return true
+  if (/\/nodata\.png(?:$|\?)/i.test(target.url_original ?? target.url)) return true
   if (mode.value !== 'live') {
     const targetTime = Date.parse(target.time_utc)
     const frames = stationFrames(stationId)
@@ -1319,21 +1383,35 @@ function stationHasNoData(stationId: string): boolean {
 // <img> per station. This is what keeps the decoded-bitmap memory bounded.
 const overlayCanvas = ref<HTMLCanvasElement | null>(null)
 
-const overlayStations = computed<RadarOverlayStation[]>(() =>
-  visibleStations.value.map((s) => {
-    const p = posOf(s.id)
-    const dimmed = viewMode.value === 'selected' && s.id !== selectedStationId.value
-    const size = (dimmed ? p.size * 0.55 : p.size) || frameSize.value
-    return { id: s.id, x: p.x, y: p.y, size, opacity: dimmed ? 0.35 : 0.9 }
-  }),
+// Which stations are drawn, and how. Their screen positions are read from
+// framePos when the overlay paints, so a pan never re-runs this computed.
+const overlayBase = computed(() =>
+  visibleStations.value.map(s => ({
+    id: s.id,
+    dimmed: viewMode.value === 'selected' && s.id !== selectedStationId.value,
+  })),
 )
+const overlayStationsNow = (): RadarOverlayStation[] =>
+  overlayBase.value.map(({ id, dimmed }) => {
+    const p = framePos.get(id) ?? { x: -9999, y: -9999, size: 0 }
+    const size = (dimmed ? p.size * 0.55 : p.size) || frameSize.value
+    return { id, x: p.x, y: p.y, size, opacity: dimmed ? 0.35 : 0.9, dimmed }
+  })
 
 const overlay = useRadarCanvasOverlay(
   overlayCanvas,
-  () => overlayStations.value,
+  () => overlayStationsNow(),
   id => imgSrc(id) ?? null,
   (url) => imageCache.get(url)?.bitmap ?? null,
-  url => !!imageCache.get(url)?.bitmap,
+  {
+    // Palette of the product's colour ramp, or null for products that keep
+    // the Canvas2D overlay (HWIND and SSA carry non-echo colours).
+    palette: () => {
+      const info = radarProductInfo(product.value)
+      return mosaicPaletteFor(info.code, RADAR_SCALES[info.scale].colors)
+    },
+    edge: () => mosaicIndexEdge(bitmapScaler.edge()),
+  },
 )
 
 // Let the projection refresh drive the repaint, so panning/zooming moves the
@@ -1341,9 +1419,6 @@ const overlay = useRadarCanvasOverlay(
 // so the radar does not trail a 60fps pan. Phones cannot keep up with that
 // and were the worst place to see jank; the 30fps throttled path is cheap
 // enough to run a full pan and the basemap and radar still move together.
-repaintOverlay = (typeof window !== 'undefined' && window.innerWidth < 640)
-  ? overlay.schedule
-  : overlay.scheduleImmediate
 
 // Resolution: the backing bitmap should match how large the frames are
 // actually DRAWN, so key it to on-screen size — not to how many stations
@@ -1371,7 +1446,7 @@ function targetEdgeFor(stations: { size: number }[]): number {
 }
 
 watch([visibleIds, viewportSize], () => {
-  const wanted = targetEdgeFor(overlayStations.value)
+  const wanted = targetEdgeFor(overlayStationsNow())
   if (bitmapScaler.setTargetEdge(wanted)) {
     // Resolution changed: drop the cached frames so they are re-scaled at
     // the new size on the next load, then repaint.
@@ -1533,19 +1608,19 @@ function initMap(center: [number, number], zoom: number) {
     // Force a resize in case the container was 0-height at construction
     // time (MapLibre sets h:0 initially, then resizes to its container).
     requestAnimationFrame(() => map?.resize())
-    refreshProjections()
+    refreshProjections(true)
   })
-  map.on('move', rafRefresh)
-  map.on('zoom', rafRefresh)
+  // Positions and the radar repaint follow every rendered frame, so they stay
+  // in the same frame as the basemap (no rAF hop, no Vue update per frame).
+  map.on('render', onRender)
   map.on('zoom', () => { resolution.value = zoomToResolution(map!.getZoom()) })
-  map.on('resize', rafRefresh)
   // Re-evaluate which stations are in view once a move settles.
   // Track the visible set *during* the pan as well as at the end. Without the
   // `move` case a station kept rendering after it scrolled off-screen and only
   // corrected itself on release, which read as the radar lagging behind.
   map.on('move', () => scheduleVisibleUpdate())
   map.on('moveend', () => scheduleVisibleUpdate(0))
-  map.on('resize', () => { scheduleVisibleUpdate(0); drawLightning() })
+  map.on('resize', () => { refreshProjections(true); scheduleVisibleUpdate(0); drawLightning() })
   // Animated moves (zoom buttons, flyTo) fire `move` continuously.
   map.on('move', () => hold())
   map.on('click', handleMapClick)
@@ -1585,7 +1660,7 @@ onMounted(async () => {
 
   // Nothing was fetched before this point, so the first load is only what is in view.
   viewReady = true
-  refreshProjections()
+  refreshProjections(true)
   updateVisible()
 })
 
@@ -1606,9 +1681,6 @@ function handleSeek(e: Event) {
   if (!Number.isNaN(v)) seek(v)
 }
 
-function posOf(stationId: string): { x: number; y: number; size: number } {
-  return overlayPos.value[stationId] ?? { x: -9999, y: -9999, size: 0 }
-}
 
 const totalFrames = computed(() => framesRef.value.length)
 // Clamped so the counter can never read e.g. "12 / 11" if the playhead is
@@ -1780,7 +1852,7 @@ const tzAbbrev = computed(() => {
     <!-- Product + station pickers. They live inside the card (bottom-left,
          above the scrubber), so they scroll away with the map instead of
          following the viewport. -->
-    <div class="absolute bottom-[4.25rem] left-3 z-10 flex items-center gap-2 sm:bottom-[5.25rem] sm:left-4">
+    <div class="absolute bottom-[10.5rem] left-3 z-10 flex items-center gap-2 sm:bottom-[5.25rem] sm:left-4">
       <RadarProductPicker :model-value="product" @update:model-value="setProduct" />
       <RadarStationPicker :stations="stations" :anchor="activeAnchor" :model-value="selectedStationId" @update:model-value="pickStation" />
     </div>
@@ -1788,7 +1860,7 @@ const tzAbbrev = computed(() => {
     <!-- Status chip + colour key, bottom-right above the scrubber. The chip
          sits on the legend's left in the same row; both disappear entirely
          when there is nothing to report. -->
-    <div class="pointer-events-none absolute bottom-[6.75rem] right-3 z-10 flex items-end gap-2 sm:bottom-[5.25rem] sm:right-4">
+    <div class="pointer-events-none absolute bottom-[13rem] right-3 z-10 flex items-end gap-2 sm:bottom-[5.25rem] sm:right-4">
       <RadarStatusIndicator
         :loading="productsLoading > 0 || imagesInFlight > 0"
         :count="inFlightTotal"
@@ -1805,7 +1877,7 @@ const tzAbbrev = computed(() => {
     </div>
 
     <!-- Combined action + player row: keep animation controls visible beside VCUT/nowcast. -->
-    <div class="absolute inset-x-3 bottom-3 z-10 flex min-w-0 items-center gap-2 rounded-2xl border border-border/60 bg-card/95 px-3 py-2 pe-14 shadow-xl sm:inset-x-4 sm:bottom-4 sm:gap-3 sm:bg-card/80 sm:px-4 sm:py-2.5 sm:pe-16 sm:shadow-2xl sm:backdrop-blur-xl">
+    <div class="absolute inset-x-3 bottom-[3.25rem] z-10 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-2.5 rounded-2xl border border-border/60 bg-card/95 px-3 pt-2.5 pb-3.5 pe-9 shadow-xl sm:inset-x-4 sm:bottom-4 sm:gap-3 sm:bg-card/80 sm:px-4 sm:py-2.5 sm:pe-16 sm:shadow-2xl sm:backdrop-blur-xl">
       <HoverCardRoot :open-delay="200" :close-delay="120">
         <HoverCardTrigger as-child>
           <button type="button" aria-label="Map tools: vertical cut and point nowcast" :aria-pressed="vcutMode" class="flex h-7 shrink-0 items-center gap-1 rounded-full border px-2 text-[10px] font-medium transition-colors sm:h-8 sm:gap-1.5 sm:px-2.5 sm:text-[11px]" :class="vcutMode ? 'border-primary bg-primary text-primary-foreground' : 'border-border/60 text-foreground/75 hover:bg-foreground/10'" @click="vcutMode ? cancelVcut() : startVcut()">
@@ -1845,19 +1917,27 @@ const tzAbbrev = computed(() => {
         </HoverCardContent>
       </HoverCardRoot>
 
-      <!-- Lightning toggle -->
-      <button
-        type="button"
-        aria-label="Toggle lightning strikes"
-        :aria-pressed="lightningEnabled"
-        class="flex h-7 shrink-0 items-center gap-1 rounded-full border px-2 text-[10px] font-medium transition-colors sm:h-8 sm:gap-1.5 sm:px-2.5 sm:text-[11px]"
-        :class="lightningEnabled ? 'border-primary bg-primary text-primary-foreground shadow-sm' : 'border-border/60 text-foreground/75 hover:bg-foreground/10'"
-        @click="lightningEnabled = !lightningEnabled"
-      >
-        <svg viewBox="0 0 16 16" class="h-3.5 w-3.5 shrink-0" fill="currentColor" aria-hidden="true"><path d="M9.5 1 3 9h4l-1 6 7-9H9l.5-5z" /></svg>
-        <span>Lightning</span>
-        <span v-if="lightningEnabled && lightningStrikes.length > 0" class="rounded-full bg-background/25 px-1.5 text-[9px] tabular-nums">{{ lightningStrikes.length }}</span>
-      </button>
+      <!-- Lightning toggle, with the same hover card as Rain Point -->
+      <HoverCardRoot :open-delay="200" :close-delay="120">
+        <HoverCardTrigger as-child>
+          <button
+            type="button"
+            aria-label="Toggle lightning strikes"
+            :aria-pressed="lightningEnabled"
+            class="flex h-7 shrink-0 items-center gap-1 rounded-full border px-2 text-[10px] font-medium transition-colors sm:h-8 sm:gap-1.5 sm:px-2.5 sm:text-[11px]"
+            :class="lightningEnabled ? 'border-primary bg-primary text-primary-foreground shadow-sm' : 'border-border/60 text-foreground/75 hover:bg-foreground/10'"
+            @click="lightningEnabled = !lightningEnabled"
+          >
+            <svg viewBox="0 0 16 16" class="h-3.5 w-3.5 shrink-0" fill="currentColor" aria-hidden="true"><path d="M9.5 1 3 9h4l-1 6 7-9H9l.5-5z" /></svg>
+            <span>Lightning</span>
+            <span v-if="lightningEnabled && lightningStrikes.length > 0" class="rounded-full bg-background/25 px-1.5 text-[9px] tabular-nums">{{ lightningStrikes.length }}</span>
+          </button>
+        </HoverCardTrigger>
+        <HoverCardContent side="top" :side-offset="8" align="start" :collision-padding="12" class="z-40 w-72 max-w-[calc(100vw-1.5rem)] rounded-2xl border border-border/60 bg-popover/95 p-3 text-popover-foreground shadow-2xl backdrop-blur-xl data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[side=bottom]:slide-in-from-top-2 data-[side=top]:slide-in-from-bottom-2">
+          <p class="text-xs font-medium">Lightning — live strikes</p>
+          <p class="mt-1 text-[11px] leading-relaxed text-muted-foreground">Each mark is a lightning strike detected in roughly the last 3 minutes. The layer refreshes about every 90 seconds while it is switched on. Hover a mark for its time, current (kA) and polarity.</p>
+        </HoverCardContent>
+      </HoverCardRoot>
 
       <RadarTimeRangeBar v-model:mode="mode" />
       <button class="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-foreground/90 text-background transition-transform hover:scale-105 sm:h-8 sm:w-8" :aria-label="playing ? 'Pause' : 'Play'" @click="playing ? pause() : play()">
@@ -1872,7 +1952,7 @@ const tzAbbrev = computed(() => {
         min="0"
         :max="Math.max(0, totalFrames - 1)"
         :value="frameIdx"
-        :class="['radar-scrubber-pill min-w-0 flex-1', isSafari ? 'thumb-pill' : '']"
+        :class="['radar-scrubber-pill order-last min-w-0 grow basis-full sm:order-none sm:basis-0', isSafari ? 'thumb-pill' : '']"
         @input="handleSeek"
       >
       <span class="hidden w-16 shrink-0 text-right text-[11px] tabular-nums text-foreground/60 sm:inline">{{ playheadLabel }} / {{ totalFrames }}</span>
@@ -2110,18 +2190,14 @@ const tzAbbrev = computed(() => {
     <!-- Station badges — visual only; selection happens via the dropdown
          above, not by clicking the badges. pointer-events:none keeps
          the map panning through them. -->
-    <div class="pointer-events-none absolute inset-0 z-[1]">
+    <div ref="badgeLayer" class="pointer-events-none absolute inset-0 z-[1]">
       <div
         v-for="s in viewMode === 'selected' && selectedStationId
           ? visibleStations.filter(ss => ss.id === selectedStationId)
           : visibleStations"
         :key="s.id"
         class="absolute sm:will-change-transform"
-        :style="{
-          transform: `translate3d(${posOf(s.id).x}px, ${posOf(s.id).y}px, 0) translate(-50%, -50%)`,
-          width: `${posOf(s.id).size || frameSize}px`,
-          height: `${posOf(s.id).size || frameSize}px`,
-        }"
+        :data-station-badge="s.id"
       >
         <div class="relative h-full w-full">
           <!-- Loading state: a dashed outline shows the extent of the frame

@@ -5,6 +5,7 @@
 
 import type { RadarProductCode } from './radarProducts'
 import { withRetry } from './useRadarFetch'
+import { withCorsReadableFrame } from '~/lib/radarFrameUrl'
 
 export interface RadarStation {
   id: string
@@ -150,10 +151,16 @@ export const useRadarApi = () => {
         // stale answer instead of mixing products on the map.
         if (product.value !== code) return null
         if (res.ok) {
-          productsByStation.value = { ...productsByStation.value, [stationId]: res.data }
+          // Full-resolution frames come back as bucket URLs the mosaic cannot read; route them via wsrv.
+          const data: RadarProduct = {
+            ...res.data,
+            latest: withCorsReadableFrame(res.data.latest),
+            last_hour: (res.data.last_hour ?? []).map(withCorsReadableFrame),
+          }
+          productsByStation.value = { ...productsByStation.value, [stationId]: data }
           failedStations.value = omit(failedStations.value, stationId)
           failedNow.value = omit(failedNow.value, stationId)
-          return res.data
+          return data
         }
         failedStations.value = { ...failedStations.value, [stationId]: true }
         failedNow.value = { ...failedNow.value, [stationId]: true }

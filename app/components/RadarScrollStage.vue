@@ -15,7 +15,7 @@ const progress = computed(() =>
 const scale = computed(() => 1 - progress.value * (1 - minScale.value))
 
 const trackStyle = computed(() => ({
-  height: `calc(100vh + ${maxScroll.value}px)`,
+  height: `calc(100dvh + ${maxScroll.value}px)`,
 }))
 
 const cardStyle = computed(() => {
@@ -71,9 +71,9 @@ onUnmounted(() => {
 
 <template>
   <div class="relative" :style="trackStyle">
-    <div class="sticky top-0 h-screen w-full">
+    <div class="sticky top-0 h-dvh w-full">
       <div
-        class="card-squircle h-screen w-full overflow-hidden border-2 will-change-transform"
+        class="card-squircle h-dvh w-full overflow-hidden border-2 will-change-transform"
         :style="cardStyle"
       >
         <slot />
