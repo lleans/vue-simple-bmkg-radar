@@ -14,6 +14,7 @@ import { useRadarApi, zoomToResolution, type RadarFrame, type RadarStation, type
 import { useLightning, type LightningStrike } from '~/composables/useLightning'
 import { useStationCatalog, catalogIndex } from '~/composables/useStationCatalog'
 import { strikeColor, strikeDisplay } from '~/lib/lightningLive'
+import { createRepaintTicker, strikeOpacity } from '~/lib/lightningAge'
 import {
   SENSOR_HIT_PX,
   nearestSensor,
@@ -313,6 +314,10 @@ function drawLightning() {
   // lightning layer (there is no separate toggle).
   drawSensors(ctx, w, h)
   if (!lightningEnabled.value) return
+  // One clock reading for the whole pass, so every strike is aged against the
+  // same instant and the fade cannot step between two strikes drawn in the
+  // same frame.
+  const nowMs = Date.now()
   for (const s of lightningStrikes.value) {
     const p = map.project([s.lon, s.lat])
     if (p.x < -20 || p.y < -20 || p.x > w + 20 || p.y > h + 20) continue
@@ -320,12 +325,16 @@ function drawLightning() {
     // Radius grows with |kA|. The colour comes from the mapping layer.
     const k = Math.min(50, Math.abs(Number(s.current_ka) || 0)) / 50
     const color = strikeColor(s)
-    ctx.globalAlpha = 0.18
+    // Age fade: both alphas are scaled by the strike's opacity, so a brand new
+    // strike is drawn at the full 0.18 / 0.9 and the oldest on screen at 0.2 of
+    // that (lib/lightningAge.ts). Colours and radii are untouched.
+    const opacity = strikeOpacity(s, nowMs)
+    ctx.globalAlpha = 0.18 * opacity
     ctx.fillStyle = color
     ctx.beginPath()
     ctx.arc(p.x, p.y, 7 + 5 * k, 0, Math.PI * 2)
     ctx.fill()
-    ctx.globalAlpha = 0.9
+    ctx.globalAlpha = 0.9 * opacity
     ctx.beginPath()
     ctx.arc(p.x, p.y, 2.5 + 2.5 * k, 0, Math.PI * 2)
     ctx.fill()
@@ -506,6 +515,18 @@ watch([lightningStrikes, lightningEnabled], () => {
   drawLightning()
   if (!lightningEnabled.value) hoveredStrike.value = null
 }, { deep: false })
+
+// The age fade only moves if the canvas is repainted as time passes, and
+// nothing else repaints the strike layer between socket frames (~5 s) or during
+// a REST-only spell (~5 min). So one 1 s interval (LIGHTNING_REPAINT_MS in
+// lib/lightningAge.ts) redraws while the layer is on — a repaint only, no fetch
+// and no merge — and is stopped when the layer goes off or the component
+// unmounts (see onUnmounted).
+const fadeTicker = createRepaintTicker(() => drawLightning())
+watch(lightningEnabled, (on) => {
+  if (on) fadeTicker.start()
+  else fadeTicker.stop()
+}, { immediate: true })
 
 // Repaint when the sensor layer's data or toggle changes, and drop the card
 // when the layer goes away.
@@ -2119,6 +2140,7 @@ onUnmounted(() => {
   resizeObserver = null
   vcutRerun.cancel()
   document.removeEventListener('visibilitychange', syncTabHidden)
+  fadeTicker.stop()
   stopLightningRefresh()
   map?.remove()
   map = null
