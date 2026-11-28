@@ -1,0 +1,118 @@
+openapi: 3.0.3
+info:
+  title: Lightning sensor catalog (contract v1)
+  version: 1.0.0
+  description: |
+    Contract for GET /api/stations/catalog, served by darma-proxy.
+    Source: the public BMKG lightning monitoring page. v1 changes are additive
+    only: new fields may be added, nothing is renamed or removed.
+    This file is a copy of the entry in darma-proxy openapi.yaml. If the two
+    disagree, the darma-proxy openapi.yaml wins and this file should be updated.
+
+paths:
+  /api/stations/catalog:
+    get:
+      summary: Lightning sensor catalog
+      description: |
+        The lightning sensors listed on the BMKG monitoring page, with their
+        coordinates. Cached for 24 hours.
+
+        The id here is the numeric BMKG sensor serial number (for example 10209).
+        It is NOT the radar station code used by /api/stations, whose ids are
+        uppercase strings such as JAK or CGK. Do not mix the two.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StationList"
+              example:
+                ok: true
+                cached: true
+                cache_age_seconds: 1200
+                pulled_at_utc: "2026-11-28T12:00:00Z"
+                data:
+                  count: 2
+                  stations:
+                    - id: 10083
+                      code: MDRLD
+                      lat: -7.041423
+                      lon: 113.915803
+                    - id: 10084
+                      code: SRGLD
+                      lat: -6.171296
+                      lon: 106.05143
+        "502":
+          description: The page could not be fetched or parsed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+              example:
+                ok: false
+                error: upstream_unavailable
+                message: BMKG page returned no usable sensor list
+
+components:
+  schemas:
+    StationList:
+      type: object
+      required: [ok, cached, cache_age_seconds, pulled_at_utc, data]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        cached:
+          type: boolean
+        cache_age_seconds:
+          type: integer
+          minimum: 0
+        pulled_at_utc:
+          type: string
+          format: date-time
+        data:
+          type: object
+          required: [count, stations]
+          properties:
+            count:
+              type: integer
+              minimum: 20
+              description: Equals the length of stations.
+            stations:
+              type: array
+              description: Sorted by id, ascending.
+              items:
+                $ref: "#/components/schemas/Station"
+
+    Station:
+      type: object
+      required: [id, code, lat, lon]
+      properties:
+        id:
+          type: integer
+          description: BMKG sensor serial number.
+        code:
+          type: string
+          pattern: "^[A-Z0-9]+$"
+        lat:
+          type: number
+          minimum: -90
+          maximum: 90
+        lon:
+          type: number
+          minimum: -180
+          maximum: 180
+
+    ApiError:
+      type: object
+      required: [ok, error, message]
+      properties:
+        ok:
+          type: boolean
+          enum: [false]
+        error:
+          type: string
+          enum: [upstream_unavailable]
+        message:
+          type: string

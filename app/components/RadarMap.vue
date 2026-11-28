@@ -12,6 +12,39 @@ import type { Map as MaplibreMap, StyleSpecification } from 'maplibre-gl'
 import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?url'
 import { useRadarApi, zoomToResolution, type RadarFrame, type RadarStation, type RadarTimeseries, type RadarVcut } from '~/composables/useRadarApi'
 import { useLightning, type LightningStrike } from '~/composables/useLightning'
+import { useStationCatalog, catalogIndex } from '~/composables/useStationCatalog'
+import { strikeColor, strikeDisplay } from '~/lib/lightningLive'
+import {
+  SENSOR_HIT_PX,
+  nearestSensor,
+  sensorColor,
+  sensorDisplay,
+  sensorMarkers,
+  type SensorMarker,
+} from '~/lib/lightningSensors'
+import {
+  MAX_RING_RADIUS_PX,
+  RING_COLOR,
+  aliveRings,
+  metresPerPixel,
+  pushRing,
+  ringAlpha,
+  ringRadiusPx,
+  strikeDotRadiusPx,
+  type SoundRing,
+} from '~/lib/soundPing'
+import { pickNewStrikes, playLightningZap, soundAllowed, soundButtonVisible, takeSoundSlot } from '~/lib/lightningSound'
+import {
+  DETECTOR_DASH,
+  DETECTOR_LINE_COLOR,
+  dashOffsetPx,
+  detectorTargets,
+  pulsePhase,
+  pulseRing,
+  sensorsVisible,
+  type DetectorTarget,
+} from '~/lib/lightningDetectors'
+import { createDebouncer, frameForVcut, pickVcutTime } from '~/lib/vcutTime'
 import { useRadarArchive } from '~/composables/useRadarArchive'
 import { RADAR_SCALES, radarProductInfo } from '~/composables/radarProducts'
 import { mosaicIndexEdge, mosaicPaletteFor } from '~/lib/radarMosaic'
@@ -43,7 +76,180 @@ const {
 } = useRadarApi()
 
 // --- Lightning layer -------------------------------------------------------
-const { strikes: lightningStrikes, enabled: lightningEnabled, startAutoRefresh: startLightningRefresh, stopAutoRefresh: stopLightningRefresh } = useLightning()
+const {
+  strikes: lightningStrikes,
+  socketStrikes: lightningSocketStrikes,
+  sensors: lightningSensors,
+  sensorsLayerOn: lightningSensorsLayerOn,
+  enabled: lightningEnabled,
+  startAutoRefresh: startLightningRefresh,
+  stopAutoRefresh: stopLightningRefresh,
+} = useLightning()
+
+// --- Lightning sound cue ---------------------------------------------------
+// A short synthesized zap when NEW socket strikes arrive (see
+// lib/lightningSound.ts). Off until the user turns the speaker on: the choice
+// lives in this ref only and is deliberately not persisted.
+const lightningSoundOn = ref(false)
+// Strike keys already sounded, and the play timestamps inside the last second
+// (the rate limit). Plain module refs, not reactive: nothing renders them.
+let soundedKeys: string[] = []
+let soundPlays: number[] = []
+const tabHidden = ref(false)
+// The rings of the sound-travel ping that follows each new strike: they grow
+// out of the strike dot at the speed of sound, scaled by SOUND_TIME_SCALE (see
+// lib/soundPing.ts). Drawn inside drawLightning(), so no separate timer.
+const soundRings = ref<SoundRing[]>([])
+// prefers-reduced-motion: no ping ring at all, as asked.
+const reducedMotion = ref(false)
+
+function syncTabHidden() {
+  tabHidden.value = typeof document !== 'undefined' && document.hidden
+}
+
+// prefers-reduced-motion: the sound-travel ping is decoration, so it is off
+// entirely (no ring) when the user asks for reduced motion. Watched live, not
+// read once at startup.
+let reducedMotionMq: MediaQueryList | null = null
+function onReducedMotionChange(e: MediaQueryListEvent) {
+  reducedMotion.value = e.matches
+}
+function setupReducedMotion() {
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return
+  reducedMotionMq = window.matchMedia('(prefers-reduced-motion: reduce)')
+  reducedMotion.value = reducedMotionMq.matches
+  reducedMotionMq.addEventListener('change', onReducedMotionChange)
+}
+
+// Only the SOCKET window can introduce a new strike, so a REST poll (which
+// re-delivers the same 3 minutes) never triggers the sound or the ping.
+// The seen-history is advanced BEFORE the mute gate: a strike that arrives
+// while the tab is hidden or the toggle is off is still marked as seen, so
+// turning the sound on (or coming back to the tab) does not replay a backlog
+// of strikes that were already on screen.
+//
+// ONE watcher does both the zap and the sound-travel ring, because both need
+// the SAME `fresh` list: two watchers would see the second one run after
+// `soundedKeys` was already advanced, and it would find nothing fresh.
+watch(lightningSocketStrikes, (list) => {
+  const { fresh, seenKeys } = pickNewStrikes(soundedKeys, list)
+  soundedKeys = seenKeys
+  if (fresh.length === 0) return
+  // The ring does NOT depend on the speaker toggle, only on reduced motion.
+  if (!reducedMotion.value && lightningEnabled.value) {
+    let rings = soundRings.value
+    const now = Date.now()
+    for (const s of fresh) {
+      rings = pushRing(rings, {
+        lat: s.lat,
+        lon: s.lon,
+        startRadiusPx: strikeDotRadiusPx(s.current_ka),
+        startedMs: now,
+      })
+    }
+    if (rings !== soundRings.value) soundRings.value = rings
+  }
+  if (!soundAllowed({ soundOn: lightningSoundOn.value, layerOn: lightningEnabled.value, hidden: tabHidden.value })) return
+  const slot = takeSoundSlot(soundPlays, Date.now())
+  soundPlays = slot.plays
+  if (slot.allowed) playLightningZap()
+})
+
+// Switching the layer off forgets the history, so turning it back on sounds
+// for the strikes that reappear (they are genuinely newly drawn again).
+watch(lightningEnabled, (on) => {
+  if (!on) {
+    soundedKeys = []
+    soundPlays = []
+    soundRings.value = []
+    hoveredDetectors.value = []
+  }
+})
+
+
+// --- Lightning sensor layer -------------------------------------------------
+// The BMKG sensors (station status plus the catalog's positions) follow the
+// LIGHTNING toggle: there is no separate switch, so they are drawn and
+// hoverable exactly while that layer is on. useLightning only parses the
+// frame's sensor field while sensorsLayerOn is true.
+// The catalog (contract v1) is fetched ONCE per layer-on, for marker positions
+// only. A failed or 502 fetch is normal: the sensors then keep the
+// Latitude/Longitude they came with. See composables/useStationCatalog.ts.
+const {
+  stations: catalogStations,
+  fetchOnce: fetchCatalogOnce,
+  reset: resetCatalog,
+} = useStationCatalog()
+const catalogById = computed(() => catalogIndex(catalogStations.value))
+// The sensor layer's visibility rule, straight from lib/lightningDetectors.ts
+// so the unit-tested function is the one the map actually obeys: on exactly
+// while the lightning layer is on, with no separate switch of its own.
+const sensorsShown = computed(() => sensorsVisible(lightningSensorsLayerOn.value))
+// Socket sensor + the position its marker is drawn at (catalog when matched).
+const sensorMarkerList = computed<SensorMarker[]>(() =>
+  sensorMarkers(lightningSensors.value, catalogById.value),
+)
+// The sensor whose card is shown on hover. Same approach as hoveredStrike:
+// formatted by sensorDisplay(), drawn from a teleported card.
+interface SelectedSensor { title: string, online: boolean, rows: { label: string, value: string }[], lng: number, lat: number }
+const hoveredSensor = ref<SelectedSensor | null>(null)
+
+function updateSensorHover(pt: { x: number, y: number }) {
+  if (!map || !sensorsShown.value) {
+    if (hoveredSensor.value) hoveredSensor.value = null
+    return
+  }
+  const hit = nearestSensor(pt, sensorMarkerList.value, (lon, lat) => map!.project([lon, lat]))
+  if (!hit) {
+    if (hoveredSensor.value) hoveredSensor.value = null
+    return
+  }
+  const display = sensorDisplay(hit.sensor)
+  const cur = hoveredSensor.value
+  // Re-place the card when the pointer moves to another sensor, and refresh
+  // its text when the same sensor's values change on a new push.
+  if (
+    !cur
+    || cur.title !== display.title
+    || cur.lng !== hit.lon
+    || cur.lat !== hit.lat
+    || JSON.stringify(cur.rows) !== JSON.stringify(display.rows)
+  ) {
+    hoveredSensor.value = {
+      title: display.title,
+      online: display.online,
+      rows: display.rows,
+      lng: hit.lon,
+      lat: hit.lat,
+    }
+  }
+}
+
+// Viewport position of the hovered sensor, so the teleported card is
+// `fixed`-positioned outside the map's overflow-hidden container. Same
+// overlayPos dependency as lightningScreen, so it tracks a pan.
+const sensorScreen = computed(() => {
+  void overlayPos.value
+  if (!map || !sensorsShown.value || !hoveredSensor.value) return null
+  const rect = mapContainer.value?.getBoundingClientRect()
+  if (!rect) return null
+  const p = map.project([hoveredSensor.value.lng, hoveredSensor.value.lat])
+  return { x: rect.left + p.x, y: rect.top + p.y }
+})
+// One switch: the sensors are on exactly while the lightning layer is on.
+watch(lightningEnabled, (on) => {
+  lightningSensorsLayerOn.value = on
+  if (on) {
+    void fetchCatalogOnce()
+  } else {
+    // Off: no sensor list is kept, no card is shown, and the once-only catalog
+    // fetch is re-armed for the next switch-on.
+    lightningSensors.value = []
+    hoveredSensor.value = null
+    resetCatalog()
+  }
+}, { immediate: true })
+
 // Strikes are drawn on their own canvas stacked ABOVE the radar frames. They
 // used to be MapLibre layers, but the radar frames are a separate canvas over
 // the map, so map-layer strikes always ended up underneath them.
@@ -52,15 +258,30 @@ const lightningCanvas = ref<HTMLCanvasElement | null>(null)
 const LIGHTNING_HIT_PX = 8
 // The strike whose details are shown on hover. Rendered as a design-system card
 // (Teleported out of the map's overflow-hidden container so it never clips).
-interface SelectedStrike { time: string; currentKa: number; polarity: string; type: string; lng: number; lat: number }
+// `detail` is the "12.3 kA · + polarity" line, pre-formatted in the mapping
+// layer together with the type line, which is empty when the feed did not say.
+interface SelectedStrike { time: string; currentKa: number; detail: string; polarity: string; type: string; lng: number; lat: number }
 const hoveredStrike = ref<SelectedStrike | null>(null)
+// The strike under the pointer INCLUDING its detector list, and when the hover
+// started (drives the dash offset and the pulse phase, so both animations run
+// from the moment the line appears). Not rendered: the canvas reads it.
+const hoveredDetectors = shallowRef<DetectorTarget[]>([])
+let hoverStartedMs = 0
+// A short pulse travels along the line. It is decoration only; the phase is
+// derived from hoverStartedMs in the draw pass, so no timer is involved.
 
+// All formatting lives in strikeDisplay() so the template only shows text it
+// was given. Polarity and strike_type only come from the REST feed: a socket
+// strike covered by no REST strike has neither, so the card then shows just
+// the current and hides the type line.
 function toSelectedStrike(s: LightningStrike): SelectedStrike {
+  const display = strikeDisplay(s)
   return {
-    time: new Date(s.time_utc).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+    time: display.time,
     currentKa: Number(s.current_ka),
-    polarity: s.polarity,
-    type: s.strike_type === 'CG' ? 'Cloud-to-ground' : s.strike_type === 'IC' ? 'In-cloud' : s.strike_type,
+    detail: display.detail,
+    polarity: display.polarity,
+    type: display.type,
     lng: s.lon,
     lat: s.lat,
   }
@@ -83,13 +304,22 @@ function drawLightning() {
   }
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
   ctx.clearRect(0, 0, w, h)
+  drawSoundRings(ctx, w, h)
+  // Detector lines sit UNDER the dots, so the strike and sensor marks stay
+  // crisp on top of them.
+  drawDetectorLines(ctx)
+  // Sensors sit UNDER the strike dots: a strike is the transient event, a
+  // sensor is the stationary station that detected it. They follow the
+  // lightning layer (there is no separate toggle).
+  drawSensors(ctx, w, h)
   if (!lightningEnabled.value) return
   for (const s of lightningStrikes.value) {
     const p = map.project([s.lon, s.lat])
     if (p.x < -20 || p.y < -20 || p.x > w + 20 || p.y > h + 20) continue
-    // CG strikes bright yellow, IC (in-cloud) a paler tone. Radius grows with |kA|.
+    // CG strikes bright yellow, IC (in-cloud) a paler tone, unknown gold.
+    // Radius grows with |kA|. The colour comes from the mapping layer.
     const k = Math.min(50, Math.abs(Number(s.current_ka) || 0)) / 50
-    const color = s.strike_type === 'CG' ? '#FFD700' : '#FFF3A3'
+    const color = strikeColor(s)
     ctx.globalAlpha = 0.18
     ctx.fillStyle = color
     ctx.beginPath()
@@ -106,6 +336,122 @@ function drawLightning() {
   }
 }
 
+// Sensor markers: a small RING per station, never the filled strike dot, so
+// the two layers cannot be mistaken for one another. Teal when the sensor is
+// online, grey when it is not. Drawn only while the lightning layer is on (no
+// separate sensors switch) AND the socket is live (the sensor list is emptied
+// when it drops, so an empty list is already the "not live" case).
+function drawSensors(ctx: CanvasRenderingContext2D, w: number, h: number) {
+  if (!map || !sensorsShown.value) return
+  for (const m of sensorMarkerList.value) {
+    const p = map.project([m.lon, m.lat])
+    if (p.x < -12 || p.y < -12 || p.x > w + 12 || p.y > h + 12) continue
+    ctx.beginPath()
+    ctx.arc(p.x, p.y, 3.5, 0, Math.PI * 2)
+    ctx.globalAlpha = 0.95
+    ctx.strokeStyle = sensorColor(m.sensor)
+    ctx.lineWidth = 1.5
+    ctx.stroke()
+    // A faint halo so a small ring stays findable on a bright radar frame.
+    ctx.globalAlpha = 0.15
+    ctx.beginPath()
+    ctx.arc(p.x, p.y, 7, 0, Math.PI * 2)
+    ctx.stroke()
+    ctx.globalAlpha = 1
+  }
+}
+
+// The detector lines for the HOVERED strike: a thin teal line from the strike
+// to each sensor that detected it, with a slow marching dash, plus a pulsing
+// ring on each of those sensors. Everything is derived from hoverStartedMs in
+// this one pass, so there is no animation timer: the map's render loop and a
+// triggerRepaint request while a line is visible do the redrawing.
+function drawDetectorLines(ctx: CanvasRenderingContext2D) {
+  const m = map
+  if (!m || !lightningEnabled.value || hoveredDetectors.value.length === 0) return
+  const strike = hoveredStrike.value
+  const targets = hoveredDetectors.value
+  if (!strike) return
+  const elapsed = Date.now() - hoverStartedMs
+  const origin = m.project([strike.lng, strike.lat])
+  const points = targets.map(t => m.project([t.lon, t.lat]))
+
+  // 1. The line itself: a thin dashed teal line. A soft dark under-line keeps
+  //    it visible over a bright radar frame.
+  for (const p of points) {
+    ctx.beginPath()
+    ctx.moveTo(origin.x, origin.y)
+    ctx.lineTo(p.x, p.y)
+    ctx.globalAlpha = 0.25
+    ctx.strokeStyle = 'rgba(0,0,0,0.55)'
+    ctx.lineWidth = 3
+    ctx.setLineDash([])
+    ctx.stroke()
+    ctx.globalAlpha = 0.85
+    ctx.strokeStyle = DETECTOR_LINE_COLOR
+    ctx.lineWidth = 1.25
+    ctx.setLineDash([...DETECTOR_DASH])
+    // Negative offset marches the dashes towards the sensor. With reduced
+    // motion the dashes stand still (the line is still drawn, just not moving).
+    ctx.lineDashOffset = reducedMotion.value ? 0 : -dashOffsetPx(elapsed)
+    ctx.stroke()
+  }
+  ctx.setLineDash([])
+  ctx.lineDashOffset = 0
+
+  // 2. A pulse on each detecting sensor: the same grow-and-fade ring as the
+  //    strike ping, in teal, repeating for as long as the line is shown. Under
+  //    prefers-reduced-motion the sensors keep their normal static ring and
+  //    nothing pulses.
+  if (!reducedMotion.value) {
+    const ring = pulseRing(pulsePhase(elapsed))
+    for (const p of points) {
+      ctx.beginPath()
+      ctx.arc(p.x, p.y, ring.radius, 0, Math.PI * 2)
+      ctx.globalAlpha = ring.alpha
+      ctx.strokeStyle = DETECTOR_LINE_COLOR
+      ctx.lineWidth = 1.5
+      ctx.stroke()
+    }
+    ctx.globalAlpha = 1
+    // One more frame while the lines are on screen: the dash and the pulse
+    // move on their own, with no timer.
+    m.triggerRepaint()
+  }
+}
+
+// The sound-travel rings. Radius and alpha come from lib/soundPing.ts; this
+// only projects and strokes. Finished rings are dropped here, in the same draw
+// pass, so nothing needs its own timer.
+function drawSoundRings(ctx: CanvasRenderingContext2D, w: number, h: number) {
+  if (!map || soundRings.value.length === 0) return
+  if (!lightningEnabled.value || reducedMotion.value) {
+    if (soundRings.value.length > 0) soundRings.value = []
+    return
+  }
+  const now = Date.now()
+  // Map scale at the map centre: metres-per-pixel, for the wave's speed.
+  const mpp = metresPerPixel(map.getZoom(), map.getCenter().lat)
+  const alive = aliveRings(soundRings.value, now, mpp)
+  if (alive.length !== soundRings.value.length) soundRings.value = alive
+  for (const r of alive) {
+    const p = map.project([r.lon, r.lat])
+    if (p.x < -MAX_RING_RADIUS_PX || p.y < -MAX_RING_RADIUS_PX || p.x > w + MAX_RING_RADIUS_PX || p.y > h + MAX_RING_RADIUS_PX) continue
+    const elapsed = now - r.startedMs
+    const radius = ringRadiusPx(elapsed, mpp, r.startRadiusPx)
+    ctx.globalAlpha = ringAlpha(elapsed)
+    ctx.strokeStyle = RING_COLOR
+    ctx.lineWidth = 1.5
+    ctx.beginPath()
+    ctx.arc(p.x, p.y, radius, 0, Math.PI * 2)
+    ctx.stroke()
+    ctx.globalAlpha = 1
+  }
+  // Rings are only young for a few seconds, so request another frame while
+  // any are alive. The map's own render loop repaints on every move anyway.
+  if (alive.length > 0) map.triggerRepaint()
+}
+
 // Nearest visible strike within the hit radius of a CSS-px point, or null.
 function nearestLightningStrike(pt: { x: number, y: number }): LightningStrike | null {
   if (!map || !lightningEnabled.value) return null
@@ -119,22 +465,53 @@ function nearestLightningStrike(pt: { x: number, y: number }): LightningStrike |
   return best
 }
 
+// Nearest sensor within SENSOR_HIT_PX (10 px), or null. Pure helper does the
+// maths; this only supplies the projection.
+function nearestSensorAt(pt: { x: number, y: number }): SensorMarker | null {
+  if (!map || !sensorsShown.value) return null
+  return nearestSensor(pt, sensorMarkerList.value, (lon, lat) => map!.project([lon, lat]), SENSOR_HIT_PX)
+}
+
 function updateLightningHover(pt: { x: number, y: number }) {
   if (!map) return
   const pickingTool = vcutMode.value || pointMode.value
+  // The strike hit test keeps PRIORITY: when a strike and a sensor are both
+  // under the pointer, the strike card wins and no sensor card is shown.
   const hit = pickingTool ? null : nearestLightningStrike(pt)
   if (!hit) {
     if (hoveredStrike.value) hoveredStrike.value = null
+    if (hoveredDetectors.value.length > 0) hoveredDetectors.value = []
+  } else {
+    const next = toSelectedStrike(hit)
+    const cur = hoveredStrike.value
+    const sameStrike = !!cur && cur.lng === next.lng && cur.lat === next.lat && cur.time === next.time
+    if (!sameStrike) {
+      hoveredStrike.value = next
+      // The detector lines follow the HOVERED strike only, so they are
+      // recomputed here, once per hover (not per frame), and the animation
+      // restarts from zero for the new one.
+      hoveredDetectors.value = detectorTargets(hit, sensorMarkerList.value, catalogById.value)
+      hoverStartedMs = Date.now()
+      if (hoveredDetectors.value.length > 0) map?.triggerRepaint()
+    }
+  }
+  if (hit) {
+    if (hoveredSensor.value) hoveredSensor.value = null
     return
   }
-  const next = toSelectedStrike(hit)
-  const cur = hoveredStrike.value
-  if (!cur || cur.lng !== next.lng || cur.lat !== next.lat || cur.time !== next.time) hoveredStrike.value = next
+  updateSensorHover(pt)
 }
 
 watch([lightningStrikes, lightningEnabled], () => {
   drawLightning()
   if (!lightningEnabled.value) hoveredStrike.value = null
+}, { deep: false })
+
+// Repaint when the sensor layer's data or toggle changes, and drop the card
+// when the layer goes away.
+watch([sensorMarkerList, lightningSensorsLayerOn], () => {
+  drawLightning()
+  if (!sensorsShown.value) hoveredSensor.value = null
 }, { deep: false })
 const archive = useRadarArchive()
 const mode = ref<'live' | 'archive'>('live')
@@ -377,6 +754,30 @@ function retryVcut() {
   if (vcutStart.value && vcutEnd.value) void requestVcut(vcutStart.value, vcutEnd.value)
 }
 
+// Playhead moves re-run an already-drawn cut, for the frame the playhead
+// settles on. Debounced (VCUT_DEBOUNCE_MS) so dragging the seekbar or the
+// 1.5 s animation does not fire one request per frame. The drawn line, and any
+// manually picked anchor radar, are kept: same start and end points. The
+// watchers live next to the timeline below, which owns frameIdx.
+const vcutRerun = createDebouncer(() => {
+  if (!vcutStart.value || !vcutEnd.value) return
+  void requestVcut(vcutStart.value, vcutEnd.value)
+})
+
+// The frame the seekbar shows, for the radar of the cut. In archive mode the
+// timeline's frame list (framesRef) is the archive window, and those frames
+// belong to the archive anchor station only, so a cut anchored to another
+// radar has no frame here and falls back. In live mode framesRef is the
+// synthesized 5-minute window that every station is sampled against, so the
+// playhead applies to any radar and warmVisible() already loads that frame for
+// each station.
+function vcutFrameFor(stationId: string): RadarFrame | null {
+  const sameStation = mode.value === 'archive'
+    ? stationId === (selectedStationId.value ?? archive.stationId.value)
+    : true
+  return frameForVcut(framesRef.value, frameIdx.value, sameStation)
+}
+
 async function requestVcut(start: [number, number], end: [number, number]) {
   vcutDismissed.value = false
   // A manually chosen anchor radar wins over the auto-pick nearest the line.
@@ -384,13 +785,26 @@ async function requestVcut(start: [number, number], end: [number, number]) {
     ? stations.value.find(s => s.id === vcutStationId.value) ?? null
     : vcutStationFor(start, end)
   if (!station) { vcutError.value = 'Radar station list is not ready.'; vcutMode.value = false; return }
-  const latestTime = productsByStation.value[station.id]?.latest?.time_utc
-  const date = latestTime ? new Date(latestTime) : new Date(Date.now() - 5 * 60_000)
-  date.setUTCSeconds(0, 0)
-  vcutLoading.value = true
-  vcutError.value = ''
+  // The cut follows the seekbar: the time of the frame the playhead is on for
+  // this radar. Only when no frame is selected does it fall back to the
+  // radar's latest scan time (and then to now minus 5 minutes), as before.
+  const picked = pickVcutTime({
+    frameTimeUtc: vcutFrameFor(station.id)?.time_utc,
+    fallbackUtc: productsByStation.value[station.id]?.latest?.time_utc,
+    nowMs: Date.now(),
+  })
   vcutResult.value = null
   vcutMode.value = false
+  if (!picked.ok) {
+    // Older than the proxy's 48 hour limit: say so instead of sending a
+    // request that can only fail, and keep the panel (and its line) open.
+    vcutLoading.value = false
+    vcutError.value = picked.error
+    return
+  }
+  const date = new Date(picked.ms)
+  vcutLoading.value = true
+  vcutError.value = ''
   try {
     const params = new URLSearchParams({
       start_lat: String(start[1]), start_lon: String(start[0]),
@@ -616,7 +1030,10 @@ function handleMapMove(e: maplibregl.MapMouseEvent) {
   const pickingTool = vcutMode.value || pointMode.value
   if (map) {
     const onStrike = !pickingTool && !!nearestLightningStrike(e.point)
-    map.getCanvas().style.cursor = pickingTool ? 'crosshair' : onStrike ? 'pointer' : ''
+    // A sensor ring is hoverable too, so the pointer cursor covers both (the
+    // strike keeps priority when both are under the pointer).
+    const onSensor = !onStrike && !pickingTool && !!nearestSensorAt(e.point)
+    map.getCanvas().style.cursor = pickingTool ? 'crosshair' : (onStrike || onSensor) ? 'pointer' : ''
   }
   updateLightningHover(e.point)
 }
@@ -978,7 +1395,7 @@ function applyBadgePositions() {
 // overlayPos. Only write it when one of them is on screen, or when the map
 // has settled; a plain pan does not touch Vue.
 function markersOnScreen(): boolean {
-  return !!(vcutStart.value || vcutEnd.value || timeseriesCoords.value || hoveredStrike.value)
+  return !!(vcutStart.value || vcutEnd.value || timeseriesCoords.value || hoveredStrike.value || hoveredSensor.value)
 }
 
 // settled = true on load, resize, and after a move ends: always writes Vue state.
@@ -999,9 +1416,15 @@ function refreshProjections(settled = false): boolean {
 // badges and repaint the radar in this same frame, then the lightning layer.
 function onRender() {
   if (!map) return
-  if (!refreshProjections()) return
-  overlay.paintNow()
-  drawLightning()
+  if (refreshProjections()) {
+    overlay.paintNow()
+    drawLightning()
+    return
+  }
+  // A still camera can still need a repaint: the sound-travel rings and the
+  // detector lines animate on their own (each asks for one more frame), and
+  // this is the hook that draws them, so no separate timer is involved.
+  if (soundRings.value.length > 0 || hoveredDetectors.value.length > 0) drawLightning()
 }
 
 // Only stations near the viewport are fetched, rendered and cached; the rest
@@ -1134,6 +1557,20 @@ const framesRef = computed<RadarFrame[]>(() =>
 
 const { idx: frameIdx, playing, currentFrame, play, pause, seek, speed, setSpeed, hold } =
   useRadarTimeline(framesRef)
+
+// The VCUT follows the seekbar: when the playhead moves and a cut is already
+// drawn, the cut is re-requested for the new frame after it settles (see
+// vcutRerun, debounced by VCUT_DEBOUNCE_MS). No line drawn, no re-run.
+watch(frameIdx, () => {
+  if (!vcutStart.value || !vcutEnd.value) return
+  vcutRerun.schedule()
+})
+
+// A line drawn in one mode/archive window does not belong to the next one, so
+// a pending re-run is dropped rather than fired against the new frame list.
+watch([mode, () => archive.frames.value], () => {
+  vcutRerun.cancel()
+})
 
 // Mode change re-keys the timeline so the playhead jumps to the first
 // frame of the new source. Switching to archive uses the picked station
@@ -1599,7 +2036,11 @@ function initMap(center: [number, number], zoom: number) {
   map.addControl(new maplibregl.AttributionControl({ compact: true }), 'bottom-right')
   // No +/- buttons: the wheel zooms, pinch works, and the UI is cleaner.
   // Keep double-click zoom, which is the remaining pointer affordance.
-  map.on('mouseout', () => { hoveredStrike.value = null })
+  map.on('mouseout', () => {
+    hoveredStrike.value = null
+    hoveredSensor.value = null
+    hoveredDetectors.value = []
+  })
   map.on('load', () => {
     drawLightning()
     if (lightningEnabled.value) startLightningRefresh()
@@ -1635,6 +2076,9 @@ onMounted(async () => {
   if (typeof navigator !== 'undefined') {
     isSafari.value = /^((?!chrome|android).)*safari/i.test(navigator.userAgent)
   }
+  setupReducedMotion()
+  syncTabHidden()
+  document.addEventListener('visibilitychange', syncTabHidden)
   syncIsMobile()
   window.addEventListener('resize', syncIsMobile, { passive: true })
   setupResizeObserver()
@@ -1667,8 +2111,14 @@ onMounted(async () => {
 onUnmounted(() => {
   cancelAnimationFrame(raf)
   if (visibleTimer) clearTimeout(visibleTimer)
+  if (reducedMotionMq) {
+    reducedMotionMq.removeEventListener('change', onReducedMotionChange)
+    reducedMotionMq = null
+  }
   resizeObserver?.disconnect()
   resizeObserver = null
+  vcutRerun.cancel()
+  document.removeEventListener('visibilitychange', syncTabHidden)
   stopLightningRefresh()
   map?.remove()
   map = null
@@ -1820,8 +2270,36 @@ const tzAbbrev = computed(() => {
             </div>
             <div class="mt-1 space-y-0.5 text-[11px] leading-relaxed text-muted-foreground">
               <div>{{ hoveredStrike.time }}</div>
-              <div>{{ hoveredStrike.currentKa.toFixed(1) }} kA · {{ hoveredStrike.polarity }} polarity</div>
-              <div>{{ hoveredStrike.type }}</div>
+              <div>{{ hoveredStrike.detail }}</div>
+              <div v-if="hoveredStrike.type">{{ hoveredStrike.type }}</div>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+
+    <!-- Lightning sensor details: same card, same Teleport-to-body approach and
+         pointer behaviour as the strike card above, positioned at the sensor
+         ring. The header line is the only teal accent, so it reads as a
+         different card from the strike one. -->
+    <Teleport to="body">
+      <Transition name="pill">
+        <div
+          v-if="hoveredSensor && sensorScreen"
+          class="pointer-events-none fixed z-[60] w-max max-w-64 -translate-x-1/2 -translate-y-full select-none"
+          :style="{ left: `${sensorScreen.x}px`, top: `${sensorScreen.y - 10}px` }"
+          role="tooltip"
+          aria-label="Lightning sensor details"
+        >
+          <div class="rounded-xl border border-border/60 bg-popover px-3 py-2 text-popover-foreground shadow-xl">
+            <div class="flex items-center gap-1.5 text-xs font-semibold tracking-tight text-[#2DD4BF]">
+              <span aria-hidden="true">◎</span><span>{{ hoveredSensor.title }}</span>
+            </div>
+            <div class="mt-1 space-y-0.5 text-[11px] leading-relaxed text-muted-foreground">
+              <div v-for="row in hoveredSensor.rows" :key="row.label" class="flex items-baseline justify-between gap-3">
+                <span>{{ row.label }}</span>
+                <span class="tabular-nums text-foreground/85">{{ row.value }}</span>
+              </div>
             </div>
           </div>
         </div>
@@ -1935,7 +2413,32 @@ const tzAbbrev = computed(() => {
         </HoverCardTrigger>
         <HoverCardContent side="top" :side-offset="8" align="start" :collision-padding="12" class="z-40 w-72 max-w-[calc(100vw-1.5rem)] rounded-2xl border border-border/60 bg-popover/95 p-3 text-popover-foreground shadow-2xl backdrop-blur-xl data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[side=bottom]:slide-in-from-top-2 data-[side=top]:slide-in-from-bottom-2">
           <p class="text-xs font-medium">Lightning — live strikes</p>
-          <p class="mt-1 text-[11px] leading-relaxed text-muted-foreground">Each mark is a lightning strike detected in roughly the last 3 minutes. The layer refreshes about every 90 seconds while it is switched on. Hover a mark for its time, current (kA) and polarity.</p>
+          <p class="mt-1 text-[11px] leading-relaxed text-muted-foreground">Each mark is a lightning strike detected in roughly the last 3 minutes. The layer refreshes about every 5 minutes while it is switched on. Hover a mark for its time, current (kA) and polarity.</p>
+          <p class="mt-2 text-xs font-medium">Sensors</p>
+          <p class="mt-1 text-[11px] leading-relaxed text-muted-foreground">The rings are the BMKG lightning sensors: teal while online, grey while not. Hover one for its status and strike counts. Hovering a strike draws a line to each sensor that detected it.</p>
+        </HoverCardContent>
+      </HoverCardRoot>
+
+      <!-- Sound cue toggle, next to the lightning one. Off by default: the
+           synthesized zap only plays once the user turns it on. Hidden with
+           the layer it belongs to (the rule lives in soundButtonVisible). -->
+      <HoverCardRoot v-if="soundButtonVisible(lightningEnabled)" :open-delay="200" :close-delay="120">
+        <HoverCardTrigger as-child>
+          <button
+            type="button"
+            aria-label="Toggle lightning sound"
+            :aria-pressed="lightningSoundOn"
+            class="flex h-7 w-7 shrink-0 items-center justify-center rounded-full border transition-colors sm:h-8 sm:w-8"
+            :class="lightningSoundOn ? 'border-primary bg-primary text-primary-foreground shadow-sm' : 'border-border/60 text-foreground/75 hover:bg-foreground/10'"
+            @click="lightningSoundOn = !lightningSoundOn"
+          >
+            <svg v-if="lightningSoundOn" viewBox="0 0 16 16" class="h-3.5 w-3.5 shrink-0" fill="currentColor" aria-hidden="true"><path d="M8 2.5 4.5 5.5H2v5h2.5L8 13.5v-11z" /><path d="M10.6 5.2a.75.75 0 0 1 1.05.1 4.5 4.5 0 0 1 0 5.4.75.75 0 1 1-1.15-.96 3 3 0 0 0 0-3.48.75.75 0 0 1 .1-1.06z" /><path d="M12.7 3.2a.75.75 0 0 1 1.06.05 7.5 7.5 0 0 1 0 9.5.75.75 0 1 1-1.1-1.02 6 6 0 0 0 0-7.46.75.75 0 0 1 .04-1.07z" /></svg>
+            <svg v-else viewBox="0 0 16 16" class="h-3.5 w-3.5 shrink-0" fill="currentColor" aria-hidden="true"><path d="M8 2.5 4.5 5.5H2v5h2.5L8 13.5v-11z" /><path d="M11 6l3 3m0-3-3 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" fill="none" /></svg>
+          </button>
+        </HoverCardTrigger>
+        <HoverCardContent side="top" :side-offset="8" align="start" :collision-padding="12" class="z-40 w-72 max-w-[calc(100vw-1.5rem)] rounded-2xl border border-border/60 bg-popover/95 p-3 text-popover-foreground shadow-2xl backdrop-blur-xl data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[side=bottom]:slide-in-from-top-2 data-[side=top]:slide-in-from-bottom-2">
+          <p class="text-xs font-medium">Lightning sound</p>
+          <p class="mt-1 text-[11px] leading-relaxed text-muted-foreground">A short synthesized zap when new strikes arrive, at most 3 per second. Silent in a background tab, and only while the lightning layer is on. Off by default.</p>
         </HoverCardContent>
       </HoverCardRoot>
 
