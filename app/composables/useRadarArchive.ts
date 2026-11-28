@@ -6,6 +6,7 @@ import type { Ref } from 'vue'
 import type { RadarFrame } from './useRadarApi'
 import { useRadarApi } from './useRadarApi'
 import { withRetry } from './useRadarFetch'
+import { withCorsReadableFrame } from '~/lib/radarFrameUrl'
 
 interface ArchiveEnvelope {
   ok: boolean
@@ -114,7 +115,7 @@ export const useRadarArchive = () => {
       if (!res.ok) throw new Error(res.message ?? res.error ?? 'archive request failed')
       const data = res.data
       endUtc.value = (data?.end_utc ?? end.toISOString()).replace(/[-:]/g, '').slice(0, 12)
-      frames.value = data?.frames ?? []
+      frames.value = (data?.frames ?? []).map(withCorsReadableFrame)
       lastFetchKey.value = key
     } catch (e) {
       // A superseded request must never touch state, otherwise its catch

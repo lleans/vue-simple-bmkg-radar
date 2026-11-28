@@ -7,7 +7,10 @@ const props = defineProps<{ product: string }>()
 // A crop of the real map with one station's reflectivity frame drawn over it
 // and its 240 km coverage ring marked. Built from the same map the user sees,
 // so the example cannot drift from reality.
-const EXAMPLE_FRAME = '/images/radar-frame-example.png'
+// Two renders of the same crop: the dark basemap and the light one. The page
+// shows whichever matches the app theme (the `dark` class on <html>).
+const EXAMPLE_FRAME_DARK = '/images/radar-frame-example.png'
+const EXAMPLE_FRAME_LIGHT = '/images/radar-frame-example-light.png'
 
 const current = computed(() => RADAR_PRODUCTS.find(p => p.code === props.product) ?? RADAR_PRODUCTS[0]!)
 
@@ -75,9 +78,17 @@ const groupNames = computed(() => {
       <figure class="mt-12 grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.1fr)] lg:items-center">
         <div class="relative overflow-hidden rounded-2xl border border-border/60 bg-muted/30">
           <img
-            :src="EXAMPLE_FRAME"
+            :src="EXAMPLE_FRAME_LIGHT"
             alt="A close-up of the radar map over East Java: one station's circular reflectivity frame in blue and green over the real basemap, with its 240 km coverage circle marked."
-            class="block w-full"
+            class="block w-full dark:hidden"
+            loading="lazy"
+            decoding="async"
+          >
+          <img
+            :src="EXAMPLE_FRAME_DARK"
+            alt=""
+            aria-hidden="true"
+            class="hidden w-full dark:block"
             loading="lazy"
             decoding="async"
           >

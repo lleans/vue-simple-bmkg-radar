@@ -65,7 +65,7 @@ const dateInput = computed({
 </script>
 
 <template>
-  <div class="flex min-w-0 items-center gap-1 rounded-full border border-border/60 bg-card/80 p-1 text-[10px] sm:gap-1.5 sm:text-[11px]">
+  <div class="flex min-w-0 flex-wrap items-center gap-1 rounded-full border border-border/60 bg-card/80 p-1 text-[10px] sm:gap-1.5 sm:text-[11px]">
     <div class="flex shrink-0 overflow-hidden rounded-full">
       <button
         type="button"

@@ -11,13 +11,28 @@
 // costs ~0 ms and uses ~1 MB instead of ~64 MB. Measured on this project:
 // drawImage into 512x512 = 0 ms, full <img> decode = 44 ms / 64 MB.
 //
-// Cross-origin note: the bucket sends no Access-Control-Allow-Origin, so the
-// canvas is tainted and getImageData/toBlob throw. That is fine here — we
-// only draw into it and let the compositor display it, which never reads
-// pixels back. Do not add getImageData/toBlob to this file.
+// Two paths, chosen per canvas:
+//   - WebGL2 mosaic (radarMosaicGl.ts, preferred): one shader pass over all
+//     stations with a max blend, so overlapping echoes do not wash out. It
+//     reads frame pixels back (getImageData), so it needs a CORS-enabled frame.
+//   - Canvas2D (the original path): one drawImage per station with 'lighten'.
+//     It never reads pixels back, so it works with tainted (no-CORS) frames.
+//
+// CORS, as measured: the proxied `url` (served via wsrv.nl) answers with
+// access-control-allow-origin: *. The upstream `url_original` allows only
+// localhost:3000, and at full resolution `url` is the upstream bucket itself,
+// which also allows only localhost:3000. A frame that cannot be read is drawn
+// with Canvas2D for as long as it stays in view.
+//
+// The WebGL context and the 2D context cannot share one canvas. When the mosaic
+// is active, the Canvas2D fallback lives on a sibling canvas, created only when
+// it is first needed (context lost, a tainted frame, or no WebGL2).
 
-import { onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
+import { onBeforeUnmount, onMounted, ref, shallowRef } from 'vue'
+import type { Ref } from 'vue'
 import type { RadarFrame } from './useRadarApi'
+import { stationStrength } from '~/lib/radarMosaic'
+import { RadarMosaicGl, type MosaicDisc } from '~/lib/radarMosaicGl'
 
 // Default backing-bitmap edge per station, in device pixels. The map raises
 // this via setTargetEdge when frames are drawn much larger than this (close
@@ -35,8 +50,18 @@ export interface RadarOverlayStation {
   x: number
   y: number
   size: number
-  // 1 for the picked station, 0.55 dimmed for the others.
+  // 0.9 for the picked station, 0.35 dimmed for the others (Canvas2D path).
   opacity: number
+  // True when the view has a selected station and this one is not it.
+  dimmed: boolean
+}
+
+export interface RadarOverlayMosaic {
+  // Palette the current product's frames are drawn with, or null to keep
+  // the product on the Canvas2D overlay (see mosaicPaletteFor).
+  palette: () => readonly string[] | null
+  // Common backing edge, in pixels, that every frame layer is resampled to.
+  edge: () => number
 }
 
 export const useRadarCanvasOverlay = (
@@ -44,12 +69,18 @@ export const useRadarCanvasOverlay = (
   getStations: () => RadarOverlayStation[],
   resolveFrame: (stationId: string) => string | null,
   resolveBitmap: (url: string) => CanvasImageSource | null,
-  isLoaded: (url: string) => boolean,
+  mosaic: RadarOverlayMosaic,
 ) => {
   const ready = ref(false)
   const size = shallowRef({ w: 0, h: 0 })
 
+  // The WebGL mosaic, when the browser gives us WebGL2 on the main canvas.
+  let gl: RadarMosaicGl | null = null
+  // The 2D context and the canvas it draws on. Without a mosaic that is the
+  // main canvas; with one it is a sibling canvas created on first need.
   let ctx: CanvasRenderingContext2D | null = null
+  let ctxEl: HTMLCanvasElement | null = null
+  let sibling: HTMLCanvasElement | null = null
   let dpr = 1
   let pending = false
   let lastPaint = 0
@@ -66,39 +97,110 @@ export const useRadarCanvasOverlay = (
     dpr = Math.min(2, window.devicePixelRatio || 1)
     el.width = Math.round(w * dpr)
     el.height = Math.round(h * dpr)
+    if (sibling) {
+      sibling.width = el.width
+      sibling.height = el.height
+    }
     size.value = { w, h }
     schedule()
+  }
+
+  /** Make `show` the visible surface; the other overlay canvas is hidden. */
+  function showSurface(show: HTMLCanvasElement) {
+    const main = canvasRef.value
+    if (main) main.style.visibility = main === show ? '' : 'hidden'
+    if (sibling) sibling.style.visibility = sibling === show ? '' : 'hidden'
+  }
+
+  /** The 2D context, creating the sibling canvas for it if the main canvas is taken by WebGL. */
+  function context2d(): CanvasRenderingContext2D | null {
+    if (ctx) return ctx
+    const main = canvasRef.value
+    if (!main?.parentElement) return null
+    const el = document.createElement('canvas')
+    // Same class and inline style, so it sits exactly where the main canvas does.
+    el.className = main.className
+    el.setAttribute('style', main.getAttribute('style') ?? '')
+    el.setAttribute('aria-hidden', 'true')
+    el.width = main.width
+    el.height = main.height
+    main.after(el)
+    sibling = el
+    ctxEl = el
+    ctx = el.getContext('2d')
+    return ctx
+  }
+
+  /**
+   * Draw the frames with the WebGL mosaic. Returns false when the mosaic
+   * cannot draw this paint, and the caller falls back to Canvas2D.
+   */
+  function paintGl(stations: RadarOverlayStation[]): boolean {
+    const el = canvasRef.value
+    const palette = mosaic.palette()
+    if (!gl || !gl.usable || !el || !palette) return false
+    const discs: MosaicDisc[] = []
+    for (const s of stations) {
+      const url = resolveFrame(s.id)
+      if (!url) continue
+      const bmp = resolveBitmap(url)
+      if (!bmp) continue
+      if (!(s.size > 0)) continue
+      discs.push({
+        url,
+        bitmap: bmp,
+        cx: s.x * dpr,
+        cy: s.y * dpr,
+        radius: (s.size / 2) * dpr,
+        strength: stationStrength(s.dimmed),
+      })
+    }
+    return gl.draw(discs, palette, mosaic.edge())
   }
 
   function paint() {
     pending = false
     const el = canvasRef.value
-    if (!el || !ctx) return
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-    ctx.clearRect(0, 0, el.width, el.height)
+    if (!el) return
+    const stations = getStations()
+    if (paintGl(stations)) {
+      showSurface(el)
+      lastPaint = performance.now()
+      return
+    }
+    const c = context2d()
+    if (!c || !ctxEl) return
+    showSurface(ctxEl)
+    paint2d(c, stations)
+    lastPaint = performance.now()
+  }
+
+  function paint2d(c: CanvasRenderingContext2D, stations: RadarOverlayStation[]) {
+    const el = ctxEl!
+    c.setTransform(dpr, 0, 0, dpr, 0, 0)
+    c.clearRect(0, 0, el.width, el.height)
     // 'lighten' takes max per channel per pixel where two stations overlap:
     // whichever station read the higher reflectivity at this point wins, which
     // matches CMAX semantics and avoids the additive brightening/wash-out that
     // 'screen' gave in overlap regions. Set once for the whole batch — in
     // Safari / WebKit, switching composite operations or clipping per station
     // inside the loop forces offscreen GPU render-pass breaks.
-    ctx.globalCompositeOperation = 'lighten'
+    c.globalCompositeOperation = 'lighten'
 
-    for (const s of getStations()) {
+    for (const s of stations) {
       const url = resolveFrame(s.id)
       if (!url) continue
       const bmp = resolveBitmap(url)
       if (!bmp) continue
       const size = s.size
       if (!(size > 0)) continue
-      ctx.globalAlpha = s.opacity
+      c.globalAlpha = s.opacity
       // The bitmap is already circular-clipped during downscaling, so we draw directly
-      ctx.drawImage(bmp, s.x - size / 2, s.y - size / 2, size, size)
+      c.drawImage(bmp, s.x - size / 2, s.y - size / 2, size, size)
     }
 
-    ctx.globalAlpha = 1
-    ctx.globalCompositeOperation = 'source-over'
-    lastPaint = performance.now()
+    c.globalAlpha = 1
+    c.globalCompositeOperation = 'source-over'
   }
 
   /**
@@ -127,11 +229,18 @@ export const useRadarCanvasOverlay = (
   let observer: ResizeObserver | null = null
 
   onMounted(() => {
-    ctx = canvasRef.value?.getContext('2d') ?? null
-    ready.value = !!ctx
+    const el = canvasRef.value
+    if (el) {
+      gl = RadarMosaicGl.create(el, () => schedule())
+      // A canvas that took WebGL cannot also give a 2D context; that context is
+      // then made on a sibling canvas by context2d().
+      if (!gl) ctx = el.getContext('2d')
+      if (ctx) ctxEl = el
+    }
+    ready.value = !!gl || !!ctx
     measure()
     observer = new ResizeObserver(measure)
-    if (canvasRef.value) observer.observe(canvasRef.value)
+    if (el) observer.observe(el)
     schedule()
   })
 
@@ -139,13 +248,18 @@ export const useRadarCanvasOverlay = (
     if (raf) cancelAnimationFrame(raf)
     observer?.disconnect()
     observer = null
+    gl?.dispose()
+    gl = null
+    sibling?.remove()
+    sibling = null
     ctx = null
+    ctxEl = null
   })
 
   /**
    * Repaint on the very next frame with no throttle. Used while the map is
    * moving: a pan redraws at 60fps, so throttling the overlay would make the
-   * radar visibly trail the basemap. Costs one clearRect + one drawImage per
+   * radar visibly trail the basemap. Costs one clear + one composite per
    * visible station, which is cheap compared with the compositing it replaces.
    */
   function scheduleImmediate() {
@@ -154,7 +268,17 @@ export const useRadarCanvasOverlay = (
     raf = requestAnimationFrame(paint)
   }
 
-  return { ready, size, schedule, scheduleImmediate, measure }
+  /**
+   * Paint synchronously, now. Used from MapLibre's 'render' event so the radar
+   * is drawn in the same frame as the basemap. Cancels any pending paint.
+   */
+  function paintNow() {
+    if (raf) cancelAnimationFrame(raf)
+    pending = false
+    paint()
+  }
+
+  return { ready, size, schedule, scheduleImmediate, paintNow, measure }
 }
 
 /**
@@ -236,7 +360,7 @@ export const createBitmapScaler = (maxEdge = BITMAP_DEFAULT_EDGE) => {
     for (const url of bitmaps.keys()) dispose(url)
   }
 
-  return { scale, get, dispose, clear, setTargetEdge, size: () => bitmaps.size }
+  return { scale, get, dispose, clear, setTargetEdge, edge: () => targetEdge, size: () => bitmaps.size }
 }
 
 export type RadarFrameSource = (stationId: string) => RadarFrame | null
