@@ -379,8 +379,12 @@ function utcMs(s: LightningStrike): number | null {
 /**
  * Arrival/observation instant of a strike in ms: the socket strike's own
  * `arrival_ms`, or the REST `time_utc`. Null when neither is usable.
+ *
+ * Exported because the age fade (lib/lightningAge.ts) must date a strike from
+ * exactly the same instant the merge de-duplicates it on — two rules would
+ * let a strike be matched as young and drawn as old.
  */
-function strikeMs(s: LightningStrike): number | null {
+export function strikeTimeMs(s: LightningStrike): number | null {
   const arrival = (s as Partial<SocketStrike>).arrival_ms
   if (typeof arrival === 'number' && Number.isFinite(arrival)) return arrival
   return utcMs(s)
@@ -464,7 +468,7 @@ export function mergeLightning(
   const graftDetectors = new Map<LightningStrike, { id: number, code: string }[]>()
 
   for (const s of socket) {
-    const arrival = strikeMs(s)
+    const arrival = strikeTimeMs(s)
     if (arrival === null) { stats.droppedInvalid++; continue }
     // Socket strikes are de-duplicated on their own key (id + position + kA),
     // NOT on the place+time key REST uses: two distinct strikes can arrive in
